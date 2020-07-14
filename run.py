@@ -1,7 +1,8 @@
 import unittest
 
-from utils.run_utils import ExperimentGrid
 from sac import sac
+from utils.run_utils import ExperimentGrid
+
 
 def run_exp(thunk, env_name, algo, params=dict()):
     grid = ExperimentGrid(f'{env_name}_{algo}')
@@ -14,6 +15,7 @@ def run_exp(thunk, env_name, algo, params=dict()):
 
 class SAC(unittest.TestCase):
     algo = 'sac'
+
     def test_hopper(self):
         run_exp(sac, 'Hopper-v2', self.algo)
 
@@ -32,6 +34,27 @@ class SAC(unittest.TestCase):
 
     def test_humanoid(self):
         run_exp(sac, 'Humanoid-v2', self.algo, params={
+            'epochs': 2000
+        })
+
+    def test_pybullet_hopper(self):
+        run_exp(sac, 'pybullet_envs:HopperBulletEnv-v0', self.algo)
+
+    def test_pybullet_walker(self):
+        run_exp(sac, 'pybullet_envs:Walker2DBulletEnv-v0', self.algo)
+
+    def test_pybullet_halfcheetah(self):
+        run_exp(sac, 'pybullet_envs:HalfCheetahBulletEnv-v0', self.algo, params={
+            'epochs': 600
+        })
+
+    def test_pybullet_ant(self):
+        run_exp(sac, 'pybullet_envs:AntBulletEnv-v0', self.algo, params={
+            'epochs': 600
+        })
+
+    def test_pybullet_humanoid(self):
+        run_exp(sac, 'pybullet_envs:HumanoidBulletEnv-v0', self.algo, params={
             'epochs': 2000
         })
 
