@@ -5,6 +5,14 @@ Twin-delayed DDPG
 import numpy as np
 import tensorflow as tf
 
+from utils.logx import EpochLogger
+from utils.tf_utils import set_tf_allow_growth
+
+set_tf_allow_growth()
+import gym
+import time
+from tqdm.auto import tqdm
+
 
 def hard_update(target: tf.keras.Model, source: tf.keras.Model):
     target.set_weights(source.get_weights())
@@ -192,7 +200,7 @@ class Actor(tf.keras.Model):
     def call(self, inputs, training=None, mask=None):
         pi_raw = self.net(inputs, training=training)
         pi_final = tf.tanh(pi_raw) * self.act_lim
-        return pi_final, pi_raw
+        return pi_final
 
 
 class TD3Agent(object):
@@ -200,12 +208,12 @@ class TD3Agent(object):
                  ob_dim,
                  ac_dim,
                  act_lim,
-                 mlp_hidden=64,
+                 mlp_hidden=256,
                  learning_rate=3e-4,
                  tau=5e-3,
                  gamma=0.99,
                  huber_delta=None,
-                 actor_noise=0.3,
+                 actor_noise=0.1,
                  target_noise=0.2,
                  noise_clip=0.5
                  ):
@@ -218,8 +226,6 @@ class TD3Agent(object):
         self.target_noise = target_noise
         self.noise_clip = noise_clip
         self.policy_net = Actor(ob_dim, ac_dim, act_lim, mlp_hidden)
-        self.target_policy_net = Actor(ob_dim, ac_dim, act_lim, mlp_hidden)
-        hard_update(self.target_policy_net, self.policy_net)
         self.q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
         self.target_q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
         hard_update(self.target_q_network, self.q_network)
@@ -242,15 +248,10 @@ class TD3Agent(object):
             tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
             tf.TensorSpec(shape=[None], dtype=tf.float32),
             tf.TensorSpec(shape=[None], dtype=tf.float32),
-            tf.TensorSpec(shape=[None], dtype=tf.float32),
         ])
 
-        self.compute_td_error = tf.function(func=self.compute_td_error, input_signature=[
-            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, self.ac_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None], dtype=tf.float32),
-            tf.TensorSpec(shape=[None], dtype=tf.float32),
+        self._update_actor = tf.function(func=self._update_actor, input_signature=[
+            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32)
         ])
 
     def set_logger(self, logger):
@@ -264,18 +265,11 @@ class TD3Agent(object):
 
     def update_target(self):
         soft_update(self.target_q_network, self.q_network, self.tau)
-        soft_update(self.target_policy_net, self.policy_net, self.tau)
 
-    def compute_td_error(self, obs, actions, next_obs, done, reward):
-        next_action, _ = self.target_policy_net(next_obs)
-        target_q_values = self.target_q_network((next_obs, next_action), training=False)
-        q_target = reward + self.gamma * (1.0 - done) * target_q_values
-        q_values = self.q_network((obs, actions), training=False)  # (None)
-        return tf.abs(q_values - q_target)
-
-    def _update_nets(self, obs, actions, next_obs, done, reward, weights):
+    def _update_nets(self, obs, actions, next_obs, done, reward):
+        print(f'Tracing _update_nets with obs={obs}, actions={actions}')
         # compute target q
-        next_action, _ = self.target_policy_net(next_obs)
+        next_action = self.policy_net(next_obs)
         # Target policy smoothing
         epsilon = tf.random.normal(shape=[tf.shape(obs)[0], self.ac_dim]) * self.target_noise
         epsilon = tf.clip_by_value(epsilon, -self.noise_clip, self.noise_clip)
@@ -293,23 +287,22 @@ class TD3Agent(object):
             # (num_ensembles, None)
             q_values_loss = tf.reduce_sum(q_values_loss, axis=0)  # (None,)
             # apply importance weights
-            q_values_loss = tf.reduce_mean(q_values_loss * weights)
+            q_values_loss = tf.reduce_mean(q_values_loss)
         q_gradients = q_tape.gradient(q_values_loss, self.q_network.trainable_variables)
         self.q_optimizer.apply_gradients(zip(q_gradients, self.q_network.trainable_variables))
-
-        td_error = tf.abs(tf.reduce_min(q_values, axis=0) - q_target)
 
         info = dict(
             Q1Vals=q_values[0],
             Q2Vals=q_values[1],
             LossQ=q_values_loss,
         )
-        return info, td_error
+        return info
 
     def _update_actor(self, obs):
+        print(f'Tracing _update_actor with obs={obs}')
         # policy loss
         with tf.GradientTape() as policy_tape:
-            a, _ = self.policy_net(obs)
+            a = self.policy_net(obs)
             q = self.q_network((obs, a))
             policy_loss = -tf.reduce_mean(q, axis=0)
         policy_gradients = policy_tape.gradient(policy_loss, self.policy_net.trainable_variables)
@@ -319,15 +312,14 @@ class TD3Agent(object):
         )
         return info
 
-    def update(self, obs, act, obs2, done, rew, weights, update_target=True):
+    def update(self, obs, act, obs2, done, rew, update_target=True):
         obs = tf.convert_to_tensor(obs, dtype=tf.float32)
         act = tf.convert_to_tensor(act, dtype=tf.float32)
         obs2 = tf.convert_to_tensor(obs2, dtype=tf.float32)
         done = tf.convert_to_tensor(done, dtype=tf.float32)
         rew = tf.convert_to_tensor(rew, dtype=tf.float32)
-        weights = tf.convert_to_tensor(weights, dtype=tf.float32)
 
-        info, td_error = self._update_nets(obs, act, obs2, done, rew, weights)
+        info = self._update_nets(obs, act, obs2, done, rew)
 
         if update_target:
             actor_info = self._update_actor(obs)
@@ -338,72 +330,91 @@ class TD3Agent(object):
             info[key] = item.numpy()
         self.logger.store(**info)
 
-        return td_error.numpy()
-
     def act(self, obs, deterministic):
         obs = tf.expand_dims(obs, axis=0)
-        pi_final, _ = self.act_batch(obs, deterministic)
+        pi_final = self.act_batch(obs, deterministic)
         return pi_final[0]
 
     def act_batch(self, obs, deterministic):
         print(f'Tracing td3 act_batch with obs {obs}')
-        pi_final, pi_raw = self.policy_net(obs)
+        pi_final = self.policy_net(obs)
         if deterministic:
-            return pi_final, pi_raw
+            return pi_final
         else:
             noise = tf.random.normal(shape=[tf.shape(obs)[0], self.ac_dim], dtype=tf.float32) * self.actor_noise
-            pi_raw = pi_raw + noise
-            pi_final = tf.tanh(pi_raw)
-            return pi_final, pi_raw
+            pi_final = pi_final + noise
+            pi_final = tf.clip_by_value(pi_final, -self.act_lim, self.act_lim)
+            return pi_final
 
 
-def main(args):
-    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_td3', data_dir='data', seed=args['seed'])
+def td3(env_name,
+        env_fn=None,
+        max_ep_len=1000,
+        steps_per_epoch=5000,
+        epochs=200,
+        start_steps=10000,
+        update_after=1000,
+        update_every=50,
+        update_per_step=1,
+        batch_size=256,
+        num_test_episodes=20,
+        logger_kwargs=dict(),
+        seed=1,
+        # agent args
+        nn_size=256,
+        learning_rate=1e-3,
+        actor_noise=0.1,
+        target_noise=0.2,
+        noise_clip=0.5,
+        tau=5e-3,
+        gamma=0.99,
+        policy_delay=2,
+        # replay
+        replay_size=int(1e6),
+        ):
     logger = EpochLogger(**logger_kwargs)
 
     logger.save_config(locals())
 
-    tf.random.set_seed(args['seed'])
-    np.random.seed(args['seed'])
+    tf.random.set_seed(seed)
+    np.random.seed(seed)
 
-    env, test_env = gym.make(args['env_name']), gym.make(args['env_name'])
+    env = gym.make(env_name) if env_fn is None else env_fn()
+    test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=False)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
 
-    agent = TD3Agent(ob_dim=obs_dim, ac_dim=act_dim, act_lim=act_limit, mlp_hidden=args['nn_size'],
-                     learning_rate=args['learning_rate'], tau=args['tau'],
-                     gamma=args['gamma'], actor_noise=args['actor_noise'],
-                     target_noise=args['target_noise'],
-                     noise_clip=args['noise_clip'])
+    agent = TD3Agent(ob_dim=obs_dim, ac_dim=act_dim, act_lim=act_limit, mlp_hidden=nn_size,
+                     learning_rate=learning_rate, tau=tau,
+                     gamma=gamma, actor_noise=actor_noise,
+                     target_noise=target_noise,
+                     noise_clip=noise_clip)
 
     agent.set_logger(logger)
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=args['replay_size'])
+    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
 
     def get_action(o, deterministic=False):
         return agent.act(tf.convert_to_tensor(o, dtype=tf.float32), tf.convert_to_tensor(deterministic)).numpy()
 
-    max_ep_len = args['max_ep_len']
-    steps_per_epoch = args['steps_per_epoch']
-    epochs = args['epochs']
-    start_steps = args['start_steps']
-    update_after = args['update_after']
-    update_every = args['update_every']
-    update_per_step = args['update_per_step']
-    batch_size = args['batch_size']
-    policy_delay = args['policy_delay']
+    def get_action_batch(o, deterministic=False):
+        return agent.act_batch(tf.convert_to_tensor(o, dtype=tf.float32), tf.convert_to_tensor(deterministic)).numpy()
 
     def test_agent():
-        for _ in trange(args['num_test_episodes'], desc='Testing'):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not (d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time
-                o, r, d, _ = test_env.step(get_action(o, True))
-                ep_ret += r
-                ep_len += 1
-            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        o, d, ep_ret, ep_len = test_env.reset(), np.zeros(shape=num_test_episodes, dtype=np.bool), \
+                               np.zeros(shape=num_test_episodes), np.zeros(shape=num_test_episodes, dtype=np.int64)
+        t = tqdm(total=1, desc='Testing')
+        while not np.all(d):
+            a = get_action_batch(o, deterministic=True)
+            o, r, d_, _ = test_env.step(a)
+            ep_ret = r * (1 - d) + ep_ret
+            ep_len = np.ones(shape=num_test_episodes, dtype=np.int64) * (1 - d) + ep_len
+            d = np.logical_or(d, d_)
+        t.update(1)
+        t.close()
+        logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
@@ -448,7 +459,6 @@ def main(args):
         if t >= update_after and t % update_every == 0:
             for j in range(update_every * update_per_step):
                 batch = replay_buffer.sample_batch(batch_size)
-                batch['weights'] = np.ones(shape=batch_size, dtype=np.float32)
                 update_target = (j % policy_delay == 0)
                 agent.update(**batch, update_target=update_target)
 
@@ -458,38 +468,30 @@ def main(args):
         if (t + 1) % steps_per_epoch == 0:
             bar.close()
 
-            epoch = (t + 1) // steps_per_epoch
+            if t >= update_after:
+                epoch = (t + 1) // steps_per_epoch
 
-            # Test the performance of the deterministic version of the agent.
-            test_agent()
+                # Test the performance of the deterministic version of the agent.
+                test_agent()
 
-            if epoch % args['save_freq'] == 0:
-                logger.save_state({'env': env}, itr=epoch)
+                # Log info about epoch
+                logger.log_tabular('Epoch', epoch)
+                logger.log_tabular('EpRet', with_min_and_max=True)
+                logger.log_tabular('TestEpRet', with_min_and_max=True)
+                logger.log_tabular('EpLen', average_only=True)
+                logger.log_tabular('TestEpLen', average_only=True)
+                logger.log_tabular('TotalEnvInteracts', t)
+                agent.log_tabular()
+                logger.log_tabular('Time', time.time() - start_time)
+                logger.dump_tabular()
 
-            # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
-            logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
-            logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
-            logger.log_tabular('TotalEnvInteracts', t)
-            agent.log_tabular()
-            logger.log_tabular('Time', time.time() - start_time)
-            logger.dump_tabular()
-
-            bar = tqdm(total=steps_per_epoch)
+            if t < total_steps:
+                bar = tqdm(total=steps_per_epoch)
 
 
 if __name__ == '__main__':
     import argparse
-    from utils.logx import EpochLogger
     from utils.run_utils import setup_logger_kwargs
-    from utils.tf_utils import set_tf_allow_growth
-
-    set_tf_allow_growth()
-    import gym
-    import time
-    from tqdm.auto import tqdm, trange
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='Hopper-v2')
@@ -498,24 +500,25 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--nn_size', '-s', type=int, default=128)
-    parser.add_argument('--actor_noise', type=float, default=0.5)
+    parser.add_argument('--nn_size', '-s', type=int, default=256)
+    parser.add_argument('--actor_noise', type=float, default=0.1)
     parser.add_argument('--target_noise', type=float, default=0.2)
     parser.add_argument('--noise_clip', type=float, default=0.5)
     parser.add_argument('--policy_delay', type=int, default=2)
     # training arguments
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=5000)
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--num_test_episodes', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--num_test_episodes', type=int, default=20)
     parser.add_argument('--max_ep_len', type=int, default=1000)
     parser.add_argument('--update_after', type=int, default=1000)
     parser.add_argument('--update_every', type=int, default=50)
     parser.add_argument('--update_per_step', type=int, default=1)
-    parser.add_argument('--save_freq', type=int, default=10)
 
     args = vars(parser.parse_args())
 
-    main(args)
+    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_td3', data_dir='data', seed=args['seed'])
+
+    td3(**args, logger_kwargs=logger_kwargs)

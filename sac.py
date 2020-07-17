@@ -287,7 +287,9 @@ class SACAgent(object):
         self.logger.log_tabular('Alpha', average_only=True)
         self.logger.log_tabular('LossAlpha', average_only=True)
 
+    @tf.function
     def update_target(self):
+        print('Tracing update_target')
         soft_update(self.target_q_network, self.q_network, self.tau)
 
     def _update_nets(self, obs, actions, next_obs, done, reward):
@@ -405,7 +407,7 @@ def sac(env_name,
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    env = env_fn()
+    env = gym.make(env_name) if env_fn is None else env_fn()
     test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=False)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -506,7 +508,8 @@ def sac(env_name,
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
 
-            bar = tqdm(total=steps_per_epoch)
+            if t < total_steps:
+                bar = tqdm(total=steps_per_epoch)
 
 
 if __name__ == '__main__':
