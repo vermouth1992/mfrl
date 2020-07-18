@@ -288,7 +288,6 @@ class SACAgent(object):
         self.logger.log_tabular('LossAlpha', average_only=True)
 
     def update_target(self):
-        print('Tracing update_target')
         soft_update(self.target_q_network, self.q_network, self.tau)
 
     def _update_nets(self, obs, actions, next_obs, done, reward):
