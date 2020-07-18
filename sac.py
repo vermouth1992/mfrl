@@ -287,7 +287,6 @@ class SACAgent(object):
         self.logger.log_tabular('Alpha', average_only=True)
         self.logger.log_tabular('LossAlpha', average_only=True)
 
-    @tf.function
     def update_target(self):
         print('Tracing update_target')
         soft_update(self.target_q_network, self.q_network, self.tau)
