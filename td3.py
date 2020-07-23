@@ -491,7 +491,10 @@ def td3(env_name,
 
 if __name__ == '__main__':
     import argparse
+    import envs
     from utils.run_utils import setup_logger_kwargs
+
+    __all__ = ['envs']
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str, default='Hopper-v2')
