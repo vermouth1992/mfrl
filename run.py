@@ -1,10 +1,11 @@
 import unittest
 
+from ppo import ppo
 from sac import sac
 from td3 import td3
 from utils.run_utils import ExperimentGrid
 
-__all__ = ['sac', 'td3']
+__all__ = ['sac', 'td3', 'ppo']
 
 
 def run_exp(thunk, env_name, algo, params=dict()):

@@ -396,5 +396,5 @@ if __name__ == '__main__':
 
     args = vars(parser.parse_args())
 
-    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_ppo', data_dir='data', seed=args['seed'])
+    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_ppo_test', data_dir='data', seed=args['seed'])
     ppo(**args, logger_kwargs=logger_kwargs)
