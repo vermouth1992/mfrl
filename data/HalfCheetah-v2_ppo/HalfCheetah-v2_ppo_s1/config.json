@@ -1,0 +1,39 @@
+{
+    "clip_ratio":	0.2,
+    "entropy_coef":	0.001,
+    "env_fn":	"<function call_experiment.<locals>.thunk_plus.<locals>.<lambda> at 0x7fb108316ae8>",
+    "env_name":	"HalfCheetah-v2",
+    "epochs":	600,
+    "exp_name":	"HalfCheetah-v2_ppo",
+    "gamma":	0.99,
+    "lam":	0.97,
+    "logger":	{
+        "<utils.logx.EpochLogger object at 0x7fb106400e10>":	{
+            "epoch_dict":	{},
+            "exp_name":	"HalfCheetah-v2_ppo",
+            "first_row":	true,
+            "log_current_row":	{},
+            "log_headers":	[],
+            "output_dir":	"data/HalfCheetah-v2_ppo/HalfCheetah-v2_ppo_s1",
+            "output_file":	{
+                "<_io.TextIOWrapper name='data/HalfCheetah-v2_ppo/HalfCheetah-v2_ppo_s1/progress.txt' mode='w' encoding='UTF-8'>":	{
+                    "mode":	"w"
+                }
+            }
+        }
+    },
+    "logger_kwargs":	{
+        "exp_name":	"HalfCheetah-v2_ppo",
+        "output_dir":	"data/HalfCheetah-v2_ppo/HalfCheetah-v2_ppo_s1"
+    },
+    "max_ep_len":	1000,
+    "mlp_hidden":	256,
+    "pi_lr":	0.0003,
+    "save_freq":	10,
+    "seed":	1,
+    "steps_per_epoch":	5000,
+    "target_kl":	0.05,
+    "train_pi_iters":	80,
+    "train_vf_iters":	80,
+    "vf_lr":	0.001
+}

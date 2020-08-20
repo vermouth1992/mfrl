@@ -1,0 +1,39 @@
+{
+    "clip_ratio":	0.2,
+    "entropy_coef":	0.001,
+    "env_fn":	"<function call_experiment.<locals>.thunk_plus.<locals>.<lambda> at 0x7efc0d2e5ae8>",
+    "env_name":	"Hopper-v2",
+    "epochs":	200,
+    "exp_name":	"Hopper-v2_ppo",
+    "gamma":	0.99,
+    "lam":	0.97,
+    "logger":	{
+        "<utils.logx.EpochLogger object at 0x7efc0d18d9b0>":	{
+            "epoch_dict":	{},
+            "exp_name":	"Hopper-v2_ppo",
+            "first_row":	true,
+            "log_current_row":	{},
+            "log_headers":	[],
+            "output_dir":	"data/Hopper-v2_ppo/Hopper-v2_ppo_s41",
+            "output_file":	{
+                "<_io.TextIOWrapper name='data/Hopper-v2_ppo/Hopper-v2_ppo_s41/progress.txt' mode='w' encoding='UTF-8'>":	{
+                    "mode":	"w"
+                }
+            }
+        }
+    },
+    "logger_kwargs":	{
+        "exp_name":	"Hopper-v2_ppo",
+        "output_dir":	"data/Hopper-v2_ppo/Hopper-v2_ppo_s41"
+    },
+    "max_ep_len":	1000,
+    "mlp_hidden":	256,
+    "pi_lr":	0.0003,
+    "save_freq":	10,
+    "seed":	41,
+    "steps_per_epoch":	5000,
+    "target_kl":	0.05,
+    "train_pi_iters":	80,
+    "train_vf_iters":	80,
+    "vf_lr":	0.001
+}
