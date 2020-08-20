@@ -522,6 +522,6 @@ if __name__ == '__main__':
 
     args = vars(parser.parse_args())
 
-    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_td3', data_dir='data', seed=args['seed'])
+    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_td3_test', data_dir='data', seed=args['seed'])
 
     td3(**args, logger_kwargs=logger_kwargs)
