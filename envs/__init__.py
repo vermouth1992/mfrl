@@ -2,7 +2,7 @@ import gym
 from gym import register
 
 from .wrappers import model_based_wrapper_dict, ModelBasedFn
-from .sync_vector_env import SyncVectorEnv
+from envs.vector.sync_vector_env import SyncVectorEnv
 
 print('Warning! Using truncated obs Ant-v2')
 del gym.envs.registry.env_specs['Ant-v2']

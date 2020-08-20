@@ -155,7 +155,7 @@ def build_mlp(input_dim, output_dim, mlp_hidden, activation='relu', out_activati
     ])
 
 
-def make_distribution(params):
+def make_normal_distribution(params):
     loc_params, scale_params = tf.split(params, 2, axis=-1)
     scale_params = tf.clip_by_value(scale_params, clip_value_min=soft_log_std_range[0],
                                     clip_value_max=soft_log_std_range[1])
@@ -165,12 +165,26 @@ def make_distribution(params):
     return pi_distribution
 
 
-class SquashedGaussianMLPActor(tf.keras.Model):
+def make_truncated_normal_distribution(params):
+    loc_params, scale_params = tf.split(params, 2, axis=-1)
+    scale_params = tf.clip_by_value(scale_params, clip_value_min=soft_log_std_range[0],
+                                    clip_value_max=soft_log_std_range[1])
+    scale_params = tf.math.softplus(scale_params)
+    loc_params = tf.tanh(loc_params)
+    pi_distribution = tfd.Independent(distribution=tfd.TruncatedNormal(loc=loc_params, scale=scale_params,
+                                                                       low=-1., high=1.),
+                                      reinterpreted_batch_ndims=1)
+    return pi_distribution
+
+
+class TruncatedGaussianMLPActor(tf.keras.Model):
     def __init__(self, ob_dim, ac_dim, act_lim, mlp_hidden):
-        super(SquashedGaussianMLPActor, self).__init__()
+        super(TruncatedGaussianMLPActor, self).__init__()
         self.net = build_mlp(ob_dim, ac_dim * 2, mlp_hidden)
         self.ac_dim = ac_dim
         self.act_lim = act_lim
+        self.pi_dist_layer = tfp.layers.DistributionLambda(
+            make_distribution_fn=lambda t: make_truncated_normal_distribution(t))
         self.call = tf.function(func=self.call, input_signature=[
             (tf.TensorSpec(shape=[None, ob_dim], dtype=tf.float32),
              tf.TensorSpec(shape=(), dtype=tf.bool))
@@ -180,8 +194,32 @@ class SquashedGaussianMLPActor(tf.keras.Model):
         inputs, deterministic = inputs
         # print(f'Tracing call with inputs={inputs}, deterministic={deterministic}')
         params = self.net(inputs)
-        pi_distribution = tfp.layers.DistributionLambda(
-            make_distribution_fn=lambda t: make_distribution(t))(params)
+        pi_distribution = self.pi_dist_layer(params)
+        pi_action = tf.cond(pred=deterministic, true_fn=lambda: pi_distribution.mean(),
+                            false_fn=lambda: pi_distribution.sample())
+        logp_pi = pi_distribution.log_prob(pi_action)
+        pi_action_final = pi_action * self.act_lim
+        return pi_action_final, logp_pi, pi_action, pi_distribution
+
+
+class SquashedGaussianMLPActor(tf.keras.Model):
+    def __init__(self, ob_dim, ac_dim, act_lim, mlp_hidden):
+        super(SquashedGaussianMLPActor, self).__init__()
+        self.net = build_mlp(ob_dim, ac_dim * 2, mlp_hidden)
+        self.ac_dim = ac_dim
+        self.act_lim = act_lim
+        self.pi_dist_layer = tfp.layers.DistributionLambda(
+            make_distribution_fn=lambda t: make_normal_distribution(t))
+        self.call = tf.function(func=self.call, input_signature=[
+            (tf.TensorSpec(shape=[None, ob_dim], dtype=tf.float32),
+             tf.TensorSpec(shape=(), dtype=tf.bool))
+        ])
+
+    def call(self, inputs):
+        inputs, deterministic = inputs
+        # print(f'Tracing call with inputs={inputs}, deterministic={deterministic}')
+        params = self.net(inputs)
+        pi_distribution = self.pi_dist_layer(params)
         pi_action = tf.cond(pred=deterministic, true_fn=lambda: pi_distribution.mean(),
                             false_fn=lambda: pi_distribution.sample())
         logp_pi = pi_distribution.log_prob(pi_action)
@@ -244,7 +282,7 @@ class SACAgent(object):
         self.act_lim = act_lim
         self.mlp_hidden = mlp_hidden
         self.huber_delta = huber_delta
-        self.policy_net = SquashedGaussianMLPActor(ob_dim, ac_dim, act_lim, mlp_hidden)
+        self.policy_net = TruncatedGaussianMLPActor(ob_dim, ac_dim, act_lim, mlp_hidden)
         self.q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
         self.target_q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
         hard_update(self.target_q_network, self.q_network)
@@ -522,13 +560,13 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', type=float, default=0.2)
     parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--nn_size', '-s', type=int, default=128)
+    parser.add_argument('--nn_size', '-s', type=int, default=256)
     # training arguments
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--start_steps', type=int, default=1000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=5000)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--num_test_episodes', type=int, default=20)
     parser.add_argument('--max_ep_len', type=int, default=1000)
     parser.add_argument('--update_after', type=int, default=1000)

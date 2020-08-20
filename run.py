@@ -66,5 +66,9 @@ class TD3(SAC):
     algo = 'td3'
 
 
+class PPO(SAC):
+    algo = 'ppo'
+
+
 if __name__ == '__main__':
     unittest.main()
