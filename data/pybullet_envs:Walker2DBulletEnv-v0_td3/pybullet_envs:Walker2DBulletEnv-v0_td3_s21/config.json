@@ -1,0 +1,43 @@
+{
+    "actor_noise":	0.1,
+    "batch_size":	256,
+    "env_fn":	"<function call_experiment.<locals>.thunk_plus.<locals>.<lambda> at 0x7f4895ebfea0>",
+    "env_name":	"pybullet_envs:Walker2DBulletEnv-v0",
+    "epochs":	200,
+    "exp_name":	"pybullet_envs:Walker2DBulletEnv-v0_td3",
+    "gamma":	0.99,
+    "learning_rate":	0.001,
+    "logger":	{
+        "<utils.logx.EpochLogger object at 0x7f4897c779e8>":	{
+            "epoch_dict":	{},
+            "exp_name":	"pybullet_envs:Walker2DBulletEnv-v0_td3",
+            "first_row":	true,
+            "log_current_row":	{},
+            "log_headers":	[],
+            "output_dir":	"data/pybullet_envs:Walker2DBulletEnv-v0_td3/pybullet_envs:Walker2DBulletEnv-v0_td3_s21",
+            "output_file":	{
+                "<_io.TextIOWrapper name='data/pybullet_envs:Walker2DBulletEnv-v0_td3/pybullet_envs:Walker2DBulletEnv-v0_td3_s21/progress.txt' mode='w' encoding='UTF-8'>":	{
+                    "mode":	"w"
+                }
+            }
+        }
+    },
+    "logger_kwargs":	{
+        "exp_name":	"pybullet_envs:Walker2DBulletEnv-v0_td3",
+        "output_dir":	"data/pybullet_envs:Walker2DBulletEnv-v0_td3/pybullet_envs:Walker2DBulletEnv-v0_td3_s21"
+    },
+    "max_ep_len":	1000,
+    "nn_size":	256,
+    "noise_clip":	0.5,
+    "num_test_episodes":	20,
+    "policy_delay":	2,
+    "replay_size":	1000000,
+    "seed":	21,
+    "start_steps":	10000,
+    "steps_per_epoch":	5000,
+    "target_noise":	0.2,
+    "tau":	0.005,
+    "update_after":	1000,
+    "update_every":	50,
+    "update_per_step":	1
+}

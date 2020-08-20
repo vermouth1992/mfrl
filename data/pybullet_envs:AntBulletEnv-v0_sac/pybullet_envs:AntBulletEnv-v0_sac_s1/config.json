@@ -1,0 +1,40 @@
+{
+    "alpha":	0.2,
+    "batch_size":	256,
+    "env_fn":	"<function call_experiment.<locals>.thunk_plus.<locals>.<lambda> at 0x7fb3e0b97ae8>",
+    "env_name":	"pybullet_envs:AntBulletEnv-v0",
+    "epochs":	600,
+    "exp_name":	"pybullet_envs:AntBulletEnv-v0_sac",
+    "gamma":	0.99,
+    "learning_rate":	0.0003,
+    "logger":	{
+        "<utils.logx.EpochLogger object at 0x7fb3dec81d68>":	{
+            "epoch_dict":	{},
+            "exp_name":	"pybullet_envs:AntBulletEnv-v0_sac",
+            "first_row":	true,
+            "log_current_row":	{},
+            "log_headers":	[],
+            "output_dir":	"data/pybullet_envs:AntBulletEnv-v0_sac/pybullet_envs:AntBulletEnv-v0_sac_s1",
+            "output_file":	{
+                "<_io.TextIOWrapper name='data/pybullet_envs:AntBulletEnv-v0_sac/pybullet_envs:AntBulletEnv-v0_sac_s1/progress.txt' mode='w' encoding='UTF-8'>":	{
+                    "mode":	"w"
+                }
+            }
+        }
+    },
+    "logger_kwargs":	{
+        "exp_name":	"pybullet_envs:AntBulletEnv-v0_sac",
+        "output_dir":	"data/pybullet_envs:AntBulletEnv-v0_sac/pybullet_envs:AntBulletEnv-v0_sac_s1"
+    },
+    "max_ep_len":	1000,
+    "nn_size":	256,
+    "num_test_episodes":	20,
+    "replay_size":	1000000,
+    "seed":	1,
+    "start_steps":	10000,
+    "steps_per_epoch":	5000,
+    "tau":	0.005,
+    "update_after":	1000,
+    "update_every":	50,
+    "update_per_step":	1
+}
