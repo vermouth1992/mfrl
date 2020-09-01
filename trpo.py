@@ -40,23 +40,29 @@ def discount_cumsum(x, discount):
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
-def conjugate_gradients(Avp, b, nsteps, residual_tol=1e-10):
-    x = tf.zeros_like(b)
-    r = tf.identity(b)
-    p = tf.identity(b)
-    rdotr = tf.matmul(r, r)
-    for i in range(nsteps):
-        _Avp = Avp(p)
-        alpha = rdotr / tf.matmul(p, _Avp)
-        x += alpha * p
-        r -= alpha * _Avp
-        new_rdotr = tf.matmul(r, r)
-        betta = new_rdotr / rdotr
-        p = r + betta * p
-        rdotr = new_rdotr
-        if rdotr < residual_tol:
-            break
-    return x
+@tf.function
+def flat_grads(grads):
+    print(f'Tracing flat_grads grads={len(grads)}')
+    grads = [tf.reshape(grad, shape=(-1,)) for grad in grads]
+    return tf.concat(grads, axis=0)
+
+
+@tf.function
+def get_flat_params_from(model: tf.keras.Model):
+    print(f'Tracing get_flat_params_from model={model.name}')
+    params = [tf.reshape(p, shape=(-1,)) for p in model.trainable_variables]
+    flat_params = tf.concat(params, axis=0)
+    return flat_params
+
+
+@tf.function
+def set_flat_params_to(model: tf.keras.Model, flat_params):
+    print(f'Tracing set_flat_params_to model={model.name}, flat_params={len(flat_params)}')
+    prev_ind = 0
+    for param in model.trainable_variables:
+        flat_size = tf.reduce_prod(param.shape)
+        param.assign(tf.reshape(flat_params[prev_ind:prev_ind + flat_size], shape=param.shape))
+        prev_ind += flat_size
 
 
 class GAEBuffer:
@@ -73,7 +79,6 @@ class GAEBuffer:
         self.rew_buf = np.zeros(shape=(num_envs, length), dtype=np.float32)
         self.ret_buf = np.zeros(shape=(num_envs, length), dtype=np.float32)
         self.val_buf = np.zeros(shape=(num_envs, length), dtype=np.float32)
-        self.logp_buf = np.zeros(shape=(num_envs, length), dtype=np.float32)
         self.gamma, self.lam = gamma, lam
         self.num_envs = num_envs
         self.max_size = length
@@ -84,7 +89,7 @@ class GAEBuffer:
     def reset(self):
         self.ptr, self.path_start_idx = 0, np.zeros(shape=(self.num_envs), dtype=np.int32)
 
-    def store(self, obs, act, rew, val, logp):
+    def store(self, obs, act, rew, val):
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
@@ -93,7 +98,6 @@ class GAEBuffer:
         self.act_buf[:, self.ptr] = act
         self.rew_buf[:, self.ptr] = rew
         self.val_buf[:, self.ptr] = val
-        self.logp_buf[:, self.ptr] = logp
         self.ptr += 1
 
     def finish_path(self, dones, last_vals):
@@ -139,12 +143,10 @@ class GAEBuffer:
         act_buf = np.reshape(self.act_buf, newshape=(-1, self.act_dim))
         ret_buf = np.reshape(self.ret_buf, newshape=(-1,))
         adv_buf = np.reshape(self.adv_buf, newshape=(-1,))
-        logp_buf = np.reshape(self.logp_buf, newshape=(-1,))
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = np.mean(adv_buf), np.std(adv_buf)
         adv_buf = (adv_buf - adv_mean) / adv_std
-        data = dict(obs=obs_buf, act=act_buf, ret=ret_buf,
-                    adv=adv_buf, logp=logp_buf)
+        data = dict(obs=obs_buf, act=act_buf, ret=ret_buf, adv=adv_buf)
         return {k: tf.convert_to_tensor(v, dtype=tf.float32) for k, v in data.items()}
 
 
@@ -169,22 +171,21 @@ def build_mlp(input_dim, output_dim, mlp_hidden, num_layers=3,
     return model
 
 
-def make_truncated_normal_distribution(loc_params, scale_params):
+def make_normal_distribution(loc_params, scale_params):
     scale_params = tf.math.softplus(scale_params)
     loc_params = tf.tanh(loc_params)
-    pi_distribution = tfd.Independent(distribution=tfd.TruncatedNormal(loc=loc_params, scale=scale_params,
-                                                                       low=-1., high=1.),
+    pi_distribution = tfd.Independent(distribution=tfd.Normal(loc=loc_params, scale=scale_params),
                                       reinterpreted_batch_ndims=1)
     return pi_distribution
 
 
-class TruncatedNormalActor(tf.keras.Model):
+class NormalActor(tf.keras.Model):
     def __init__(self, obs_dim, act_dim, act_lim, mlp_hidden):
-        super(TruncatedNormalActor, self).__init__()
+        super(NormalActor, self).__init__()
         self.net = build_mlp(input_dim=obs_dim, output_dim=act_dim, mlp_hidden=mlp_hidden)
         self.log_std = tf.Variable(initial_value=-0.5 * tf.ones(act_dim))
         self.pi_dist_layer = tfp.layers.DistributionLambda(
-            make_distribution_fn=lambda t: make_truncated_normal_distribution(t, self.log_std))
+            make_distribution_fn=lambda t: make_normal_distribution(t, self.log_std))
         self.act_lim = act_lim
 
     def call(self, inputs):
@@ -200,8 +201,8 @@ class TRPOAgent(tf.keras.Model):
                  ):
 
         super(TRPOAgent, self).__init__()
-        self.policy_net = TruncatedNormalActor(obs_dim=obs_dim, act_dim=act_dim,
-                                               act_lim=act_lim, mlp_hidden=mlp_hidden)
+        self.policy_net = NormalActor(obs_dim=obs_dim, act_dim=act_dim,
+                                      act_lim=act_lim, mlp_hidden=mlp_hidden)
         self.v_optimizer = tf.keras.optimizers.Adam(learning_rate=vf_lr)
         self.value_net = build_mlp(input_dim=obs_dim, output_dim=1, squeeze=True, mlp_hidden=mlp_hidden)
         self.value_net.compile(optimizer=self.v_optimizer, loss='mse')
@@ -229,11 +230,12 @@ class TRPOAgent(tf.keras.Model):
         self.logger = logger
 
     def log_tabular(self):
-        self.logger.log_tabular('PolicyLoss', average_only=True)
-        self.logger.log_tabular('ValueLoss', average_only=True)
-        self.logger.log_tabular('Entropy', average_only=True)
-        self.logger.log_tabular('AvgKL', average_only=True)
-        self.logger.log_tabular('StopIter', average_only=True)
+        self.logger.log_tabular('LossPi', average_only=True)
+        self.logger.log_tabular('LossV', average_only=True)
+        self.logger.log_tabular('KL', average_only=True)
+        self.logger.log_tabular('DeltaLossPi', average_only=True)
+        self.logger.log_tabular('DeltaLossV', average_only=True)
+        self.logger.log_tabular('BacktrackIters', average_only=True)
 
     def call(self, inputs, training=None, mask=None):
         pi_distribution = self.policy_net(inputs)
@@ -243,111 +245,154 @@ class TRPOAgent(tf.keras.Model):
     def act_batch(self, obs):
         pi_distribution = self.policy_net(obs)
         pi_action = pi_distribution.sample()
-        log_prob = pi_distribution.log_prob(pi_action)
         v = self.value_net(obs)
-        return pi_action, log_prob, v
+        return pi_action, v
 
-    @tf.function
-    def _update_policy_step(self, obs, act, adv, old_log_prob):
-        print(f'Tracing _update_policy_step with obs={obs}')
-        with tf.GradientTape() as tape:
-            distribution = self.policy_net(obs)
-            entropy = tf.reduce_mean(distribution.entropy())
-            log_prob = distribution.log_prob(act)
-            negative_approx_kl = log_prob - old_log_prob
-            approx_kl_mean = tf.reduce_mean(-negative_approx_kl)
+    def _compute_kl(self, obs, old_pi):
+        pi = self.policy_net(obs)
+        kl_loss = tfp.distributions.kl_divergence(pi, old_pi)
+        kl_loss = tf.reduce_mean(kl_loss)
+        return kl_loss
 
-            ratio = tf.exp(negative_approx_kl)
-            surr1 = ratio * adv
-            surr2 = tf.clip_by_value(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * adv
-            policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+    def _compute_loss_pi(self, obs, act, logp, adv):
+        distribution = self.policy_net(obs)
+        log_prob = distribution.log_prob(act)
+        negative_approx_kl = log_prob - logp
+        ratio = tf.exp(negative_approx_kl)
+        surr1 = ratio * adv
+        policy_loss = -tf.reduce_mean(surr1, axis=0)
+        return policy_loss
 
-            loss = policy_loss - entropy * self.entropy_coef
-
-        gradients = tape.gradient(loss, self.policy_net.trainable_variables)
-        self.pi_optimizer.apply_gradients(zip(gradients, self.policy_net.trainable_variables))
-
-        info = dict(
-            PolicyLoss=policy_loss,
-            Entropy=entropy,
-            AvgKL=approx_kl_mean,
-        )
-        return info
-
-    def update(self, obs, act, ret, adv, logp):
-        assert tf.is_tensor(obs), f'obs must be a tf tensor. Got {obs}'
-
-        def compute_kl(obs, old_pi):
-            pi = self.policy_net(obs)
-            kl_loss = tfp.distributions.kl_divergence(pi, old_pi)
-            kl_loss = tf.reduce_mean(kl_loss)
-            return kl_loss
-
-        def hessian_vector_product(obs, old_pi, v):
-            with tf.GradientTape() as t2:
-                with tf.GradientTape() as t1:
-                    kl = compute_kl(obs, old_pi)
-                inner_grads = t1.gradient(kl, self.policy_net.trainable_variables)
-
-            kl_v = tf.reduce_sum(inner_grads * v)
-            grads = t2.gradient(kl_v, self.policy_net.trainable_variables)
-            return grads + v * self.damping_coeff
-
-        # compute old pi
-        old_pi = self.policy_net(obs)
-
+    def _compute_gradient(self, obs, act, logp, adv):
         # compute pi gradients
         with tf.GradientTape() as tape:
-            distribution = self.policy_net(obs)
-            log_prob = distribution.log_prob(act)
-            negative_approx_kl = log_prob - logp
-            ratio = tf.exp(negative_approx_kl)
-            surr1 = ratio * adv
-            policy_loss = -tf.reduce_mean(surr1, axis=0)
+            policy_loss = self._compute_loss_pi(obs, act, logp, adv)
         grads = tape.gradient(policy_loss, self.policy_net.trainable_variables)
+        grads = flat_grads(grads)
+        # flat grads
+        return grads, policy_loss
 
-        Hx = lambda v: hessian_vector_product(obs, old_pi, v)
-        x = conjugate_gradients(Hx, grads, self.cg_iters)
+    def _hessian_vector_product(self, obs, p):
+        # compute Hx
+        old_pi = self.policy_net(obs)
+        with tf.GradientTape() as t2:
+            with tf.GradientTape() as t1:
+                kl = self._compute_kl(obs, old_pi)
+            inner_grads = t1.gradient(kl, self.policy_net.trainable_variables)
+            # flat gradients
+            inner_grads = flat_grads(inner_grads)
+            kl_v = tf.reduce_sum(inner_grads * p)
+        grads = t2.gradient(kl_v, self.policy_net.trainable_variables)
+        grads = flat_grads(grads)
+        _Avp = grads + p * self.damping_coeff
+        return _Avp
 
-        alpha = tf.sqrt(2. * self.delta / (tf.matmul(x, Hx(x)) + 1e-8))
+    @tf.function
+    def _conjugate_gradients(self, obs, b, nsteps, residual_tol=1e-10):
+        """
 
-        old_params = self.policy_net.get_weights()
+        Args:
+            Avp: a callable computes matrix vector produce. Note that vector here has NO dummy dimension
+            b: A^{-1}b
+            nsteps: max number of steps
+            residual_tol:
 
-        def set_and_eval(step):
-            new_params = old_params - alpha * x * step
-            self.policy_net.set_weights(new_params)
-            loss_pi, kl_loss = compute_kl_loss_pi(data, old_pi)
-            return kl_loss.item(), loss_pi.item()
+        Returns:
+
+        """
+        print(f'Tracing _conjugate_gradients b={b}, nsteps={nsteps}')
+        x = tf.zeros_like(b)
+        r = tf.identity(b)
+        p = tf.identity(b)
+        rdotr = tf.tensordot(r, r, axes=1)
+        for _ in tf.range(nsteps):
+            _Avp = self._hessian_vector_product(obs, p)
+            # compute conjugate gradient
+            alpha = rdotr / tf.tensordot(p, _Avp, axes=1)
+            x += alpha * p
+            r -= alpha * _Avp
+            new_rdotr = tf.tensordot(r, r, axes=1)
+            betta = new_rdotr / rdotr
+            p = r + betta * p
+            rdotr = new_rdotr
+            if rdotr < residual_tol:
+                break
+        return x
+
+    def _compute_natural_gradient(self, obs, act, logp, adv):
+        print(f'Tracing _compute_natural_gradient with obs={obs}, act={act}, logp={logp}, adv={adv}')
+        grads, policy_loss = self._compute_gradient(obs, act, logp, adv)
+        x = self._conjugate_gradients(obs, grads, self.cg_iters)
+        alpha = tf.sqrt(2. * self.delta / (tf.tensordot(x, self._hessian_vector_product(obs, x),
+                                                        axes=1) + 1e-8))
+        return alpha * x, policy_loss
+
+    def _set_and_eval(self, obs, act, logp, adv, old_params, old_pi, natural_gradient, step):
+        new_params = old_params - natural_gradient * step
+        set_flat_params_to(self.policy_net, new_params)
+        loss_pi = self._compute_loss_pi(obs, act, logp, adv)
+        kl_loss = self._compute_kl(obs, old_pi)
+        return kl_loss, loss_pi
+
+    @tf.function
+    def _update_actor(self, obs, act, adv):
+        print(f'Tracing _update_actor with obs={obs}, act={act}, adv={adv}')
+        old_params = get_flat_params_from(self.policy_net)
+        old_pi = self.policy_net(obs)
+        logp = old_pi.log_prob(act)
+        natural_gradient, pi_l_old = self._compute_natural_gradient(obs, act, logp, adv)
 
         if self.algo == 'npg':
             # npg has no backtracking or hard kl constraint enforcement
-            kl, pi_l_new = set_and_eval(step=1.)
-
+            kl, pi_l_new = self._set_and_eval(obs, act, logp, adv, old_params, old_pi,
+                                              natural_gradient, step=1.)
+            j = tf.constant(value=0, dtype=tf.int32)
         elif self.algo == 'trpo':
             # trpo augments npg with backtracking line search, hard kl
-            for j in range(self.backtrack_iters):
-                kl, pi_l_new = set_and_eval(step=self.backtrack_coeff ** j)
+            pi_l_new = tf.zeros(shape=(), dtype=tf.float32)
+            kl = tf.zeros(shape=(), dtype=tf.float32)
+            for j in tf.range(self.backtrack_iters):
+                steps = tf.pow(self.backtrack_coeff, tf.cast(j, dtype=tf.float32))
+                kl, pi_l_new = self._set_and_eval(obs, act, logp, adv, old_params, old_pi,
+                                                  natural_gradient, step=steps)
                 if kl <= self.delta and pi_l_new <= pi_l_old:
-                    self.logger.log('Accepting new params at step %d of line search.' % j)
-                    self.logger.store(BacktrackIters=j)
+                    tf.print('Accepting new params at step', j, 'of line search.')
                     break
 
                 if j == self.backtrack_iters - 1:
-                    self.logger.log('Line search failed! Keeping old params.')
-                    self.logger.store(BacktrackIters=j)
-                    kl, pi_l_new = set_and_eval(step=0.)
+                    tf.print('Line search failed! Keeping old params.')
+                    kl, pi_l_new = self._set_and_eval(obs, act, logp, adv, old_params, old_pi,
+                                                      natural_gradient, step=0.)
+        info = dict(
+            LossPi=pi_l_old, KL=kl,
+            DeltaLossPi=(pi_l_new - pi_l_old),
+            BacktrackIters=j
+        )
+        return info
+
+    def update(self, obs, act, ret, adv):
+        assert tf.is_tensor(obs), f'obs must be a tf tensor. Got {obs}'
+        info = self._update_actor(obs, act, adv)
+        for key, item in info.items():
+            info[key] = item.numpy()
 
         # train the value network
-        for i in range(self.train_vf_iters):
-            loss = self.value_net.train_on_batch(x=obs, y=ret)
+        v_l_old = self.value_net.evaluate(x=obs, y=ret, verbose=False)
+        for i in range(self.train_v_iters):
+            loss_v = self.value_net.train_on_batch(x=obs, y=ret)
 
-        self.logger.store(ValueLoss=loss)
+        info['LossV'] = v_l_old
+        info['DeltaLossV'] = loss_v - v_l_old
+
+        # Log changes from update
+        self.logger.store(**info)
 
 
-def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
-        steps_per_epoch=5000, epochs=200, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_vf_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, entropy_coef=1e-3, logger_kwargs=dict(), save_freq=10):
+def trpo(env_name, env_fn=None, mlp_hidden=128, seed=0,
+         steps_per_epoch=5000, epochs=200, gamma=0.99, delta=0.01, vf_lr=1e-3,
+         train_v_iters=80, damping_coeff=0.1, cg_iters=10, backtrack_iters=10,
+         backtrack_coeff=0.8, lam=0.97, max_ep_len=1000, logger_kwargs=dict(),
+         save_freq=10, algo='trpo'):
     if env_fn is None:
         env_fn = lambda: gym.make(env_name)
 
@@ -374,11 +419,12 @@ def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
 
     # Instantiate policy
     agent = TRPOAgent(obs_dim=obs_dim, act_dim=act_dim, act_lim=act_lim, mlp_hidden=mlp_hidden,
-                      pi_lr=pi_lr, vf_lr=vf_lr, lam=lam, clip_ratio=clip_ratio,
-                      entropy_coef=entropy_coef, target_kl=target_kl)
+                      delta=delta, vf_lr=vf_lr, damping_coeff=damping_coeff, cg_iters=cg_iters,
+                      backtrack_iters=backtrack_iters, backtrack_coeff=backtrack_coeff,
+                      train_v_iters=train_v_iters, algo=algo)
     agent.set_logger(logger)
 
-    buffer = PPOBuffer(obs_dim=obs_dim, act_dim=act_dim, num_envs=num_envs, length=max_ep_len,
+    buffer = GAEBuffer(obs_dim=obs_dim, act_dim=act_dim, num_envs=num_envs, length=max_ep_len,
                        gamma=gamma, lam=lam)
 
     def collect_trajectories():
@@ -386,12 +432,11 @@ def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
         ep_ret = np.zeros(shape=num_envs, dtype=np.float32)
         ep_len = np.zeros(shape=num_envs, dtype=np.int32)
         for t in trange(max_ep_len, desc='Collecting'):
-            act, logp, val = agent.act_batch(tf.convert_to_tensor(obs, dtype=tf.float32))
+            act, val = agent.act_batch(tf.convert_to_tensor(obs, dtype=tf.float32))
             act = act.numpy()
-            logp = logp.numpy()
             val = val.numpy()
             obs2, rew, dones, infos = env.step(act)
-            buffer.store(obs, act, rew, val, logp)
+            buffer.store(obs, act, rew, val)
             logger.store(VVals=val)
             ep_ret += rew
             ep_len += 1
@@ -450,5 +495,5 @@ if __name__ == '__main__':
 
     args = vars(parser.parse_args())
 
-    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_ppo_test', data_dir='data', seed=args['seed'])
-    ppo(**args, logger_kwargs=logger_kwargs)
+    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_trpo_test', data_dir='data', seed=args['seed'])
+    trpo(**args, logger_kwargs=logger_kwargs)
