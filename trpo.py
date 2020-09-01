@@ -1,5 +1,5 @@
 """
-Proximal Policy Optimization
+Trust Region Policy Optimization (Schulman et al, 2017)
 """
 
 import time
@@ -38,6 +38,25 @@ def discount_cumsum(x, discount):
          x2]
     """
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
+def conjugate_gradients(Avp, b, nsteps, residual_tol=1e-10):
+    x = tf.zeros_like(b)
+    r = tf.identity(b)
+    p = tf.identity(b)
+    rdotr = tf.matmul(r, r)
+    for i in range(nsteps):
+        _Avp = Avp(p)
+        alpha = rdotr / tf.matmul(p, _Avp)
+        x += alpha * p
+        r -= alpha * _Avp
+        new_rdotr = tf.matmul(r, r)
+        betta = new_rdotr / rdotr
+        p = r + betta * p
+        rdotr = new_rdotr
+        if rdotr < residual_tol:
+            break
+    return x
 
 
 class GAEBuffer:
@@ -174,40 +193,26 @@ class TruncatedNormalActor(tf.keras.Model):
         return pi_distribution
 
 
-class PPOAgent(tf.keras.Model):
+class TRPOAgent(tf.keras.Model):
     def __init__(self, obs_dim, act_dim, act_lim, mlp_hidden=64,
-                 pi_lr=1e-3, vf_lr=1e-3, clip_ratio=0.2,
-                 entropy_coef=0.001, target_kl=0.05,
-                 train_pi_iters=80, train_vf_iters=80
+                 delta=0.01, vf_lr=1e-3, damping_coeff=0.1, cg_iters=10, backtrack_iters=10,
+                 backtrack_coeff=0.8, train_v_iters=80, algo='npg'
                  ):
-        """
-        Args:
-            policy_net: The policy net must implement following methods:
-                - forward: takes obs and return action_distribution and value
-                - forward_action: takes obs and return action_distribution
-                - forward_value: takes obs and return value.
-            The advantage is that we can save computation if we only need to fetch parts of the graph. Also, we can
-            implement policy and value in both shared and non-shared way.
-            learning_rate:
-            lam:
-            clip_param:
-            entropy_coef:
-            target_kl:
-            max_grad_norm:
-        """
-        super(PPOAgent, self).__init__()
+
+        super(TRPOAgent, self).__init__()
         self.policy_net = TruncatedNormalActor(obs_dim=obs_dim, act_dim=act_dim,
                                                act_lim=act_lim, mlp_hidden=mlp_hidden)
-        self.pi_optimizer = tf.keras.optimizers.Adam(learning_rate=pi_lr)
         self.v_optimizer = tf.keras.optimizers.Adam(learning_rate=vf_lr)
         self.value_net = build_mlp(input_dim=obs_dim, output_dim=1, squeeze=True, mlp_hidden=mlp_hidden)
         self.value_net.compile(optimizer=self.v_optimizer, loss='mse')
 
-        self.target_kl = target_kl
-        self.clip_ratio = clip_ratio
-        self.entropy_coef = entropy_coef
-        self.train_pi_iters = train_pi_iters
-        self.train_vf_iters = train_vf_iters
+        self.delta = delta
+        self.damping_coeff = damping_coeff
+        self.cg_iters = cg_iters
+        self.backtrack_iters = backtrack_iters
+        self.backtrack_coeff = backtrack_coeff
+        self.train_v_iters = train_v_iters
+        self.algo = algo
 
         self.obs_dim = obs_dim
         self.act_dim = act_dim
@@ -269,24 +274,74 @@ class PPOAgent(tf.keras.Model):
         )
         return info
 
-    def update_policy(self, obs, act, ret, adv, logp):
+    def update(self, obs, act, ret, adv, logp):
         assert tf.is_tensor(obs), f'obs must be a tf tensor. Got {obs}'
-        for i in range(self.train_pi_iters):
-            info = self._update_policy_step(obs, act, adv, logp)
-            if info['AvgKL'] > 1.5 * self.target_kl:
-                self.logger.log('Early stopping at step %d due to reaching max kl.' % i)
-                break
 
-        self.logger.store(StopIter=i)
+        def compute_kl(obs, old_pi):
+            pi = self.policy_net(obs)
+            kl_loss = tfp.distributions.kl_divergence(pi, old_pi)
+            kl_loss = tf.reduce_mean(kl_loss)
+            return kl_loss
 
+        def hessian_vector_product(obs, old_pi, v):
+            with tf.GradientTape() as t2:
+                with tf.GradientTape() as t1:
+                    kl = compute_kl(obs, old_pi)
+                inner_grads = t1.gradient(kl, self.policy_net.trainable_variables)
+
+            kl_v = tf.reduce_sum(inner_grads * v)
+            grads = t2.gradient(kl_v, self.policy_net.trainable_variables)
+            return grads + v * self.damping_coeff
+
+        # compute old pi
+        old_pi = self.policy_net(obs)
+
+        # compute pi gradients
+        with tf.GradientTape() as tape:
+            distribution = self.policy_net(obs)
+            log_prob = distribution.log_prob(act)
+            negative_approx_kl = log_prob - logp
+            ratio = tf.exp(negative_approx_kl)
+            surr1 = ratio * adv
+            policy_loss = -tf.reduce_mean(surr1, axis=0)
+        grads = tape.gradient(policy_loss, self.policy_net.trainable_variables)
+
+        Hx = lambda v: hessian_vector_product(obs, old_pi, v)
+        x = conjugate_gradients(Hx, grads, self.cg_iters)
+
+        alpha = tf.sqrt(2. * self.delta / (tf.matmul(x, Hx(x)) + 1e-8))
+
+        old_params = self.policy_net.get_weights()
+
+        def set_and_eval(step):
+            new_params = old_params - alpha * x * step
+            self.policy_net.set_weights(new_params)
+            loss_pi, kl_loss = compute_kl_loss_pi(data, old_pi)
+            return kl_loss.item(), loss_pi.item()
+
+        if self.algo == 'npg':
+            # npg has no backtracking or hard kl constraint enforcement
+            kl, pi_l_new = set_and_eval(step=1.)
+
+        elif self.algo == 'trpo':
+            # trpo augments npg with backtracking line search, hard kl
+            for j in range(self.backtrack_iters):
+                kl, pi_l_new = set_and_eval(step=self.backtrack_coeff ** j)
+                if kl <= self.delta and pi_l_new <= pi_l_old:
+                    self.logger.log('Accepting new params at step %d of line search.' % j)
+                    self.logger.store(BacktrackIters=j)
+                    break
+
+                if j == self.backtrack_iters - 1:
+                    self.logger.log('Line search failed! Keeping old params.')
+                    self.logger.store(BacktrackIters=j)
+                    kl, pi_l_new = set_and_eval(step=0.)
+
+        # train the value network
         for i in range(self.train_vf_iters):
             loss = self.value_net.train_on_batch(x=obs, y=ret)
 
-        for key, item in info.items():
-            info[key] = item.numpy()
-        info['ValueLoss'] = loss
-
-        self.logger.store(**info)
+        self.logger.store(ValueLoss=loss)
 
 
 def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
@@ -318,14 +373,12 @@ def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
     assert act_lim == 1., f'act_lim must be 1. Got {act_lim}'
 
     # Instantiate policy
-    agent = PPOAgent(obs_dim=obs_dim, act_dim=act_dim, act_lim=act_lim, mlp_hidden=mlp_hidden,
-                     pi_lr=pi_lr, vf_lr=vf_lr, clip_ratio=clip_ratio,
-                     entropy_coef=entropy_coef, target_kl=target_kl,
-                     train_pi_iters=train_pi_iters, train_vf_iters=train_vf_iters
-                     )
+    agent = TRPOAgent(obs_dim=obs_dim, act_dim=act_dim, act_lim=act_lim, mlp_hidden=mlp_hidden,
+                      pi_lr=pi_lr, vf_lr=vf_lr, lam=lam, clip_ratio=clip_ratio,
+                      entropy_coef=entropy_coef, target_kl=target_kl)
     agent.set_logger(logger)
 
-    buffer = GAEBuffer(obs_dim=obs_dim, act_dim=act_dim, num_envs=num_envs, length=max_ep_len,
+    buffer = PPOBuffer(obs_dim=obs_dim, act_dim=act_dim, num_envs=num_envs, length=max_ep_len,
                        gamma=gamma, lam=lam)
 
     def collect_trajectories():
@@ -377,7 +430,7 @@ def ppo(env_name, env_fn=None, mlp_hidden=256, seed=0,
 
     for epoch in range(epochs):
         collect_trajectories()
-        agent.update_policy(**buffer.get())
+        agent.update(**buffer.get())
         logger.log_tabular('Epoch', epoch + 1)
         logger.log_tabular('EpRet', with_min_and_max=True)
         logger.log_tabular('EpLen', average_only=True)

@@ -444,6 +444,7 @@ def sac(env_name,
     np.random.seed(seed)
 
     env = gym.make(env_name) if env_fn is None else env_fn()
+    env.seed(seed)
     test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=False)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
