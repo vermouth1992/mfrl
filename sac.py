@@ -56,6 +56,13 @@ def combined_shape(length, shape=None):
     return (length, shape) if np.isscalar(shape) else (length, *shape)
 
 
+@tf.function
+def flat_grads(grads):
+    print(f'Tracing flat_grads grads={len(grads)}')
+    grads = [tf.reshape(grad, shape=(-1,)) for grad in grads]
+    return tf.concat(grads, axis=0)
+
+
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer for SAC agents.
@@ -384,7 +391,7 @@ class SACAgent(object):
             LossQ=q_values_loss,
             LossAlpha=alpha_loss,
             LossPi=policy_loss,
-            PolicyGradient=policy_gradients,
+            PolicyGradient=flat_grads(policy_gradients),
         )
         return info
 
