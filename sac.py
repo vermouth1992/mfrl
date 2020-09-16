@@ -324,6 +324,7 @@ class SACAgent(object):
         self.logger.log_tabular('LossQ', average_only=True)
         self.logger.log_tabular('Alpha', average_only=True)
         self.logger.log_tabular('LossAlpha', average_only=True)
+        self.logger.log_tabular('PolicyGradient', average_only=True)
 
     def update_target(self):
         soft_update(self.target_q_network, self.q_network, self.tau)
@@ -383,6 +384,7 @@ class SACAgent(object):
             LossQ=q_values_loss,
             LossAlpha=alpha_loss,
             LossPi=policy_loss,
+            PolicyGradient=policy_gradients,
         )
         return info
 
