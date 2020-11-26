@@ -2,6 +2,7 @@
 Implement soft actor critic agent here
 """
 
+import os
 import time
 
 import gym
@@ -230,7 +231,7 @@ class EnsembleQNet(tf.keras.Model):
             return tf.reduce_min(q, axis=0)
 
 
-class SACAgent(object):
+class SACAgent(tf.keras.Model):
     def __init__(self,
                  ob_dim,
                  ac_dim,
@@ -243,6 +244,7 @@ class SACAgent(object):
                  target_entropy=None,
                  huber_delta=None,
                  ):
+        super(SACAgent, self).__init__()
         self.ob_dim = ob_dim
         self.ac_dim = ac_dim
         self.act_lim = act_lim
@@ -399,6 +401,7 @@ def sac(env_name,
         gamma=0.99,
         # replay
         replay_size=int(1e6),
+        save_freq=10,
         ):
     if env_fn is None:
         env_fn = lambda: gym.make(env_name)
@@ -497,6 +500,9 @@ def sac(env_name,
 
             epoch = (t + 1) // steps_per_epoch
 
+            if epoch % save_freq == 0:
+                agent.save_weights(filepath=os.path.join(logger_kwargs['output_dir'], f'agent_final_{epoch}.ckpt'))
+
             # Test the performance of the deterministic version of the agent.
             test_agent()
 
@@ -513,6 +519,8 @@ def sac(env_name,
 
             if t < total_steps:
                 bar = tqdm(total=steps_per_epoch)
+
+    agent.save_weights(filepath=os.path.join(logger_kwargs['output_dir'], f'agent_final.ckpt'))
 
 
 if __name__ == '__main__':
@@ -539,9 +547,15 @@ if __name__ == '__main__':
     parser.add_argument('--update_after', type=int, default=1000)
     parser.add_argument('--update_every', type=int, default=50)
     parser.add_argument('--update_per_step', type=int, default=1)
+    parser.add_argument('--save_freq', type=int, default=10)
+    parser.add_argument('--gpu', action='store_true')
 
     args = vars(parser.parse_args())
 
     logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_sac_test', data_dir='data', seed=args['seed'])
+
+    use_gpu = args.pop('gpu')
+    if not use_gpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
 
     sac(**args, logger_kwargs=logger_kwargs)
