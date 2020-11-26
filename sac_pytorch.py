@@ -2,55 +2,37 @@
 Implement soft actor critic agent here
 """
 
+import copy
+import math
 import time
 
 import gym
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
+from torch import distributions as td
+from torch import nn
 from tqdm.auto import tqdm
 
 from utils.logx import EpochLogger
-from utils.tf_utils import set_tf_allow_growth
-
-set_tf_allow_growth()
-
-import tensorflow_probability as tfp
 
 eps = 1e-6
-tfd = tfp.distributions
 
 soft_log_std_range = (-10., 5.)
 
 
-@tf.function
-def soft_update(target: tf.keras.Model, source: tf.keras.Model, tau):
-    print('Tracing soft_update_tf')
-    for target_param, source_param in zip(target.variables, source.variables):
-        target_param.assign(target_param * (1. - tau) + source_param * tau)
+def soft_update(target: nn.Module, source: nn.Module, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
 
-@tf.function
-def hard_update(target: tf.keras.Model, source: tf.keras.Model):
-    print('Tracing hard_update_tf')
-    for target_param, source_param in zip(target.variables, source.variables):
-        target_param.assign(source_param)
+def hard_update(target: nn.Module, source: nn.Module):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(param.data)
 
 
 def inverse_softplus(x, beta=1.):
     return np.log(np.exp(x * beta) - 1.) / beta
-
-
-def huber_loss(y_true, y_pred, delta=1.0):
-    """Huber loss.
-    https://en.wikipedia.org/wiki/Huber_loss
-    """
-    error = y_true - y_pred
-    cond = tf.abs(error) < delta
-
-    squared_loss = 0.5 * tf.square(error)
-    linear_loss = delta * (tf.abs(error) - 0.5 * delta)
-
-    return tf.where(cond, squared_loss, linear_loss)
 
 
 def combined_shape(length, shape=None):
@@ -91,110 +73,140 @@ class ReplayBuffer:
         return batch
 
 
-class EnsembleDense(tf.keras.layers.Dense):
-    def __init__(self, num_ensembles, units, **kwargs):
-        super(EnsembleDense, self).__init__(units=units, **kwargs)
+class EnsembleLinear(nn.Module):
+    __constants__ = ['num_ensembles', 'in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(self, num_ensembles: int, in_features: int, out_features: int, bias: bool = True) -> None:
+        super(EnsembleLinear, self).__init__()
         self.num_ensembles = num_ensembles
-
-    def build(self, input_shape):
-        last_dim = int(input_shape[-1])
-        self.kernel = self.add_weight(
-            'kernel',
-            shape=[self.num_ensembles, last_dim, self.units],
-            initializer=self.kernel_initializer,
-            regularizer=self.kernel_regularizer,
-            constraint=self.kernel_constraint,
-            dtype=self.dtype,
-            trainable=True)
-        if self.use_bias:
-            self.bias = self.add_weight(
-                'bias',
-                shape=[self.num_ensembles, 1, self.units],
-                initializer=self.bias_initializer,
-                regularizer=self.bias_regularizer,
-                constraint=self.bias_constraint,
-                dtype=self.dtype,
-                trainable=True)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.Tensor(num_ensembles, in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(num_ensembles, 1, out_features))
         else:
-            self.bias = None
-        self.built = True
+            self.register_parameter('bias', None)
+        self.reset_parameters()
 
-    def call(self, inputs):
-        outputs = tf.linalg.matmul(inputs, self.kernel)  # (num_ensembles, None, units)
-        if self.use_bias:
-            outputs = outputs + self.bias
-        if self.activation is not None:
-            return self.activation(outputs)  # pylint: disable=not-callable
-        return outputs
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(input, self.weight) + self.bias
+
+    def extra_repr(self) -> str:
+        return 'num_ensembles={}, in_features={}, out_features={}, bias={}'.format(
+            self.num_ensembles, self.in_features, self.out_features, self.bias is not None
+        )
 
 
-class SqueezeLayer(tf.keras.layers.Layer):
-    def __init__(self, axis=-1):
+class SqueezeLayer(nn.Module):
+    def __init__(self, dim=-1):
         super(SqueezeLayer, self).__init__()
-        self.axis = axis
+        self.dim = dim
 
-    def call(self, inputs, **kwargs):
-        return tf.squeeze(inputs, axis=self.axis)
+    def forward(self, inputs):
+        return torch.squeeze(inputs, dim=self.dim)
 
 
 def build_mlp_ensemble(input_dim, output_dim, mlp_hidden, num_ensembles, num_layers=3,
-                       activation='relu', out_activation=None, squeeze=True):
-    model = tf.keras.Sequential()
-    model.add(tf.keras.layers.InputLayer(batch_input_shape=(num_ensembles, None, input_dim)))
-    for _ in range(num_layers - 1):
-        model.add(EnsembleDense(num_ensembles, mlp_hidden, activation=activation))
-    model.add(EnsembleDense(num_ensembles, output_dim, activation=out_activation))
+                       activation=nn.ReLU, out_activation=None, squeeze=False):
+    layers = []
+    if num_layers == 1:
+        layers.append(EnsembleLinear(num_ensembles, input_dim, output_dim))
+    else:
+        layers.append(EnsembleLinear(num_ensembles, input_dim, mlp_hidden))
+        layers.append(activation())
+        for _ in range(num_layers - 2):
+            layers.append(EnsembleLinear(num_ensembles, mlp_hidden, mlp_hidden))
+            layers.append(activation())
+        layers.append(EnsembleLinear(num_ensembles, mlp_hidden, output_dim))
+
+    if out_activation is not None:
+        layers.append(out_activation())
     if output_dim == 1 and squeeze is True:
-        model.add(SqueezeLayer(axis=-1))
+        layers.append(SqueezeLayer(dim=-1))
+    model = nn.Sequential(*layers)
     return model
 
 
-def build_mlp(input_dim, output_dim, mlp_hidden, activation='relu', out_activation=None):
-    return tf.keras.Sequential([
-        tf.keras.layers.InputLayer(input_shape=(input_dim,)),
-        tf.keras.layers.Dense(mlp_hidden, activation=activation),
-        tf.keras.layers.Dense(mlp_hidden, activation=activation),
-        tf.keras.layers.Dense(output_dim, activation=out_activation),
-    ])
+def build_mlp(input_dim, output_dim, mlp_hidden, num_layers=3,
+              activation=nn.ReLU, out_activation=None, squeeze=False):
+    layers = []
+    if num_layers == 1:
+        layers.append(nn.Linear(input_dim, output_dim))
+    else:
+        layers.append(nn.Linear(input_dim, mlp_hidden))
+        layers.append(activation())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(mlp_hidden, mlp_hidden))
+            layers.append(activation())
+        layers.append(nn.Linear(mlp_hidden, output_dim))
+
+    if out_activation is not None:
+        layers.append(out_activation())
+    if output_dim == 1 and squeeze is True:
+        layers.append(SqueezeLayer(dim=-1))
+    model = nn.Sequential(*layers)
+    return model
 
 
 def make_normal_distribution(params):
-    loc_params, scale_params = tf.split(params, 2, axis=-1)
-    scale_params = tf.clip_by_value(scale_params, clip_value_min=soft_log_std_range[0],
-                                    clip_value_max=soft_log_std_range[1])
-    scale_params = tf.math.softplus(scale_params)
-    pi_distribution = tfd.Independent(distribution=tfd.Normal(loc=loc_params, scale=scale_params),
-                                      reinterpreted_batch_ndims=1)
+    loc_params, scale_params = torch.split(params, params.shape[-1] // 2, dim=-1)
+    scale_params = torch.clip(scale_params, min=soft_log_std_range[0],
+                              max=soft_log_std_range[1])
+    scale_params = F.softplus(scale_params)
+    pi_distribution = td.Independent(base_distribution=td.Normal(loc=loc_params, scale=scale_params),
+                                     reinterpreted_batch_ndims=1)
     return pi_distribution
 
 
-class SquashedGaussianMLPActor(tf.keras.Model):
-    def __init__(self, ob_dim, ac_dim, act_lim, mlp_hidden):
+def apply_squash(log_pi, pi_action):
+    log_pi -= torch.sum(2. * (math.log(2.) - pi_action - F.softplus(-2. * pi_action)), dim=-1)
+    return log_pi
+
+
+class SquashedGaussianMLPActor(nn.Module):
+    def __init__(self, ob_dim, ac_dim, mlp_hidden):
         super(SquashedGaussianMLPActor, self).__init__()
         self.net = build_mlp(ob_dim, ac_dim * 2, mlp_hidden)
         self.ac_dim = ac_dim
-        self.act_lim = act_lim
-        self.pi_dist_layer = tfp.layers.DistributionLambda(
-            make_distribution_fn=lambda t: make_normal_distribution(t))
-        self.call = tf.function(func=self.call, input_signature=[
-            (tf.TensorSpec(shape=[None, ob_dim], dtype=tf.float32),
-             tf.TensorSpec(shape=(), dtype=tf.bool))
-        ])
+        self.pi_dist_layer = lambda param: make_normal_distribution(param)
 
-    def call(self, inputs):
+    def select_action(self, inputs):
+        inputs, deterministic = inputs
+        params = self.net(inputs)
+        pi_distribution = self.pi_dist_layer(params)
+        if deterministic:
+            pi_action = pi_distribution.mean
+        else:
+            pi_action = pi_distribution.rsample()
+        pi_action_final = torch.tanh(pi_action)
+        return pi_action_final
+
+    def forward(self, inputs):
         inputs, deterministic = inputs
         # print(f'Tracing call with inputs={inputs}, deterministic={deterministic}')
         params = self.net(inputs)
         pi_distribution = self.pi_dist_layer(params)
-        pi_action = tf.cond(pred=deterministic, true_fn=lambda: pi_distribution.mean(),
-                            false_fn=lambda: pi_distribution.sample())
+        if deterministic:
+            pi_action = pi_distribution.mean
+        else:
+            pi_action = pi_distribution.rsample()
         logp_pi = pi_distribution.log_prob(pi_action)
-        logp_pi -= tf.reduce_sum(2. * (tf.math.log(2.) - pi_action - tf.math.softplus(-2. * pi_action)), axis=-1)
-        pi_action_final = tf.tanh(pi_action) * self.act_lim
+        logp_pi = apply_squash(logp_pi, pi_action)
+        pi_action_final = torch.tanh(pi_action)
         return pi_action_final, logp_pi, pi_action, pi_distribution
 
 
-class EnsembleQNet(tf.keras.Model):
+class EnsembleQNet(nn.Module):
     def __init__(self, ob_dim, ac_dim, mlp_hidden, num_ensembles=2):
         super(EnsembleQNet, self).__init__()
         self.ob_dim = ob_dim
@@ -207,77 +219,55 @@ class EnsembleQNet(tf.keras.Model):
                                         num_ensembles=self.num_ensembles,
                                         num_layers=3,
                                         squeeze=True)
-        self.build(input_shape=[(None, ob_dim), (None, ac_dim)])
 
-    def get_config(self):
-        config = super(EnsembleQNet, self).get_config()
-        config.update({
-            'ob_dim': self.ob_dim,
-            'ac_dim': self.ac_dim,
-            'mlp_hidden': self.mlp_hidden,
-            'num_ensembles': self.num_ensembles
-        })
-        return config
-
-    def call(self, inputs, training=None, mask=None):
+    def forward(self, inputs, training=None):
         obs, act = inputs
-        inputs = tf.concat((obs, act), axis=-1)
-        inputs = tf.tile(tf.expand_dims(inputs, axis=0), (self.num_ensembles, 1, 1))
+        inputs = torch.cat((obs, act), dim=-1)
+        inputs = torch.unsqueeze(inputs, dim=0)  # (1, None, obs_dim + act_dim)
+        inputs = inputs.repeat(self.num_ensembles, 1, 1)
         q = self.q_net(inputs)  # (num_ensembles, None)
         if training:
             return q
         else:
-            return tf.reduce_min(q, axis=0)
+            return torch.min(q, dim=0)[0]
 
 
-class SACAgent(object):
+class LagrangeLayer(nn.Module):
+    def __init__(self, initial_value=0.):
+        super(LagrangeLayer, self).__init__()
+        self.log_alpha = nn.Parameter(data=torch.as_tensor(inverse_softplus(initial_value), dtype=torch.float32))
+
+    def forward(self):
+        return F.softplus(self.log_alpha)
+
+
+class SACAgent(nn.Module):
     def __init__(self,
                  ob_dim,
                  ac_dim,
-                 act_lim,
                  mlp_hidden=256,
                  learning_rate=3e-4,
                  alpha=1.0,
                  tau=5e-3,
                  gamma=0.99,
                  target_entropy=None,
-                 huber_delta=None,
                  ):
+        super(SACAgent, self).__init__()
         self.ob_dim = ob_dim
         self.ac_dim = ac_dim
-        self.act_lim = act_lim
         self.mlp_hidden = mlp_hidden
-        self.huber_delta = huber_delta
-        self.policy_net = SquashedGaussianMLPActor(ob_dim, ac_dim, act_lim, mlp_hidden)
+        self.policy_net = SquashedGaussianMLPActor(ob_dim, ac_dim, mlp_hidden)
         self.q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
-        self.target_q_network = EnsembleQNet(ob_dim, ac_dim, mlp_hidden)
-        hard_update(self.target_q_network, self.q_network)
+        self.target_q_network = copy.deepcopy(self.q_network)
+        self.alpha_net = LagrangeLayer(initial_value=alpha)
 
-        self.policy_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
-        self.q_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
-
-        self.log_alpha = tf.Variable(initial_value=inverse_softplus(alpha), dtype=tf.float32)
-        self.alpha_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
+        self.policy_optimizer = torch.optim.Adam(params=self.policy_net.parameters(), lr=learning_rate)
+        self.q_optimizer = torch.optim.Adam(params=self.q_network.parameters(), lr=learning_rate)
+        self.alpha_optimizer = torch.optim.Adam(params=self.alpha_net.parameters(), lr=learning_rate)
         self.target_entropy = -ac_dim if target_entropy is None else target_entropy
 
         self.tau = tau
         self.gamma = gamma
-
-        self.build_tf_function()
-
-    def build_tf_function(self):
-        self.act_batch = tf.function(func=self.act_batch, input_signature=[
-            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.bool),
-        ])
-
-        self._update_nets = tf.function(func=self._update_nets, input_signature=[
-            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, self.ac_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None, self.ob_dim], dtype=tf.float32),
-            tf.TensorSpec(shape=[None], dtype=tf.float32),
-            tf.TensorSpec(shape=[None], dtype=tf.float32),
-        ])
 
     def set_logger(self, logger):
         self.logger = logger
@@ -307,39 +297,37 @@ class SACAgent(object):
         Returns: None
 
         """
-        alpha = tf.math.softplus(self.log_alpha)
-
-        next_action, next_action_log_prob, _, _ = self.policy_net((next_obs, False))
-        target_q_values = self.target_q_network((next_obs, next_action), training=False) - alpha * next_action_log_prob
-        q_target = reward + self.gamma * (1.0 - done) * target_q_values
+        with torch.no_grad():
+            alpha = self.alpha_net()
+            next_action, next_action_log_prob, _, _ = self.policy_net((next_obs, False))
+            target_q_values = self.target_q_network((next_obs, next_action),
+                                                    training=False) - alpha * next_action_log_prob
+            q_target = reward + self.gamma * (1.0 - done) * target_q_values
 
         # q loss
-        with tf.GradientTape() as q_tape:
-            q_values = self.q_network((obs, actions), training=True)  # (num_ensembles, None)
-            if self.huber_delta is not None:
-                q_values_loss = huber_loss(tf.expand_dims(q_target, axis=0), q_values, delta=self.huber_delta)
-            else:
-                q_values_loss = 0.5 * tf.square(tf.expand_dims(q_target, axis=0) - q_values)
-            # (num_ensembles, None)
-            q_values_loss = tf.reduce_sum(q_values_loss, axis=0)  # (None,)
-            # apply importance weights
-            q_values_loss = tf.reduce_mean(q_values_loss)
-        q_gradients = q_tape.gradient(q_values_loss, self.q_network.trainable_variables)
-        self.q_optimizer.apply_gradients(zip(q_gradients, self.q_network.trainable_variables))
+        q_values = self.q_network((obs, actions), training=True)  # (num_ensembles, None)
+        q_values_loss = 0.5 * torch.square(torch.unsqueeze(q_target, dim=0) - q_values)
+        # (num_ensembles, None)
+        q_values_loss = torch.sum(q_values_loss, dim=0)  # (None,)
+        # apply importance weights
+        q_values_loss = torch.mean(q_values_loss)
+        self.q_optimizer.zero_grad()
+        q_values_loss.backward()
+        self.q_optimizer.step()
 
         # policy loss
-        with tf.GradientTape() as policy_tape:
-            action, log_prob, _, _ = self.policy_net((obs, False))
-            q_values_pi_min = self.q_network((obs, action), training=False)
-            policy_loss = tf.reduce_mean(log_prob * alpha - q_values_pi_min)
-        policy_gradients = policy_tape.gradient(policy_loss, self.policy_net.trainable_variables)
-        self.policy_optimizer.apply_gradients(zip(policy_gradients, self.policy_net.trainable_variables))
+        action, log_prob, _, _ = self.policy_net((obs, False))
+        q_values_pi_min = self.q_network((obs, action), training=False)
+        policy_loss = torch.mean(log_prob * alpha - q_values_pi_min)
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
 
-        with tf.GradientTape() as alpha_tape:
-            alpha = tf.math.softplus(self.log_alpha)
-            alpha_loss = -tf.reduce_mean(alpha * (log_prob + self.target_entropy))
-        alpha_gradient = alpha_tape.gradient(alpha_loss, self.log_alpha)
-        self.alpha_optimizer.apply_gradients(zip([alpha_gradient], [self.log_alpha]))
+        alpha = self.alpha_net()
+        alpha_loss = -torch.mean(alpha * (log_prob.detach() + self.target_entropy))
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
 
         info = dict(
             Q1Vals=q_values[0],
@@ -353,29 +341,30 @@ class SACAgent(object):
         return info
 
     def update(self, obs, act, obs2, done, rew, update_target=True):
-        obs = tf.convert_to_tensor(obs, dtype=tf.float32)
-        act = tf.convert_to_tensor(act, dtype=tf.float32)
-        obs2 = tf.convert_to_tensor(obs2, dtype=tf.float32)
-        done = tf.convert_to_tensor(done, dtype=tf.float32)
-        rew = tf.convert_to_tensor(rew, dtype=tf.float32)
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        act = torch.as_tensor(act, dtype=torch.float32, device=self.device)
+        obs2 = torch.as_tensor(obs2, dtype=torch.float32, device=self.device)
+        done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        rew = torch.as_tensor(rew, dtype=torch.float32, device=self.device)
 
         info = self._update_nets(obs, act, obs2, done, rew)
         for key, item in info.items():
-            info[key] = item.numpy()
+            info[key] = item.detach().cpu().numpy()
         self.logger.store(**info)
 
         if update_target:
             self.update_target()
 
     def act(self, obs, deterministic):
-        obs = tf.expand_dims(obs, axis=0)
-        pi_final = self.act_batch(obs, deterministic)[0]
-        return pi_final
+        with torch.no_grad():
+            obs = torch.unsqueeze(obs, dim=0)
+            pi_final = self.act_batch(obs, deterministic)[0]
+            return pi_final
 
     def act_batch(self, obs, deterministic):
-        print(f'Tracing sac act_batch with obs {obs}')
-        pi_final = self.policy_net((obs, deterministic))[0]
-        return pi_final
+        with torch.no_grad():
+            pi_final = self.policy_net.select_action((obs, deterministic))
+            return pi_final
 
 
 def sac(env_name,
@@ -406,7 +395,8 @@ def sac(env_name,
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
-    tf.random.set_seed(seed)
+    torch.set_deterministic(True)
+    torch.manual_seed(seed)
     np.random.seed(seed)
 
     env = gym.make(env_name) if env_fn is None else env_fn()
@@ -417,18 +407,22 @@ def sac(env_name,
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
+    assert act_limit == 1.0
 
-    agent = SACAgent(obs_dim, ac_dim=act_dim, act_lim=act_limit, mlp_hidden=nn_size,
+    agent = SACAgent(obs_dim, ac_dim=act_dim, mlp_hidden=nn_size,
                      learning_rate=learning_rate, alpha=alpha, tau=tau,
                      gamma=gamma)
+    agent.device = torch.device("cuda")
+    agent.to(agent.device)
     agent.set_logger(logger)
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
 
     def get_action(o, deterministic=False):
-        return agent.act(tf.convert_to_tensor(o, dtype=tf.float32), tf.convert_to_tensor(deterministic)).numpy()
+        return agent.act(torch.as_tensor(o, dtype=torch.float32, device=agent.device), deterministic).cpu().numpy()
 
     def get_action_batch(o, deterministic=False):
-        return agent.act_batch(tf.convert_to_tensor(o, dtype=tf.float32), tf.convert_to_tensor(deterministic)).numpy()
+        return agent.act_batch(torch.as_tensor(o, dtype=torch.float32, device=agent.device),
+                               deterministic).cpu().numpy()
 
     def test_agent():
         o, d, ep_ret, ep_len = test_env.reset(), np.zeros(shape=num_test_episodes, dtype=np.bool), \
@@ -542,6 +536,7 @@ if __name__ == '__main__':
 
     args = vars(parser.parse_args())
 
-    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_sac_test', data_dir='data', seed=args['seed'])
+    logger_kwargs = setup_logger_kwargs(exp_name=args['env_name'] + '_sac_pytorch_test',
+                                        data_dir='data', seed=args['seed'])
 
     sac(**args, logger_kwargs=logger_kwargs)
