@@ -285,10 +285,10 @@ class SACAgent(tf.keras.Model):
         with tf.GradientTape() as q_tape, tf.GradientTape() as alpha_tape:
             q_tape.watch(self.q_network.trainable_variables)
 
-            alpha = self.log_alpha(obs)
+            alpha = self.log_alpha(next_obs)
             # compute target Q value with double Q learning
             target_q_values = self.target_q_network(next_obs, training=False)  # (None, act_dim)
-            next_policy = self._get_pi_distribution(obs)
+            next_policy = self._get_pi_distribution(next_obs)
             v = tf.reduce_sum(target_q_values * next_policy.probs_parameter(), axis=-1)
             policy_entropy = next_policy.entropy()
             target_q_values = v + alpha * policy_entropy
@@ -527,7 +527,7 @@ if __name__ == '__main__':
     parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--start_steps', type=int, default=1000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=5000)
