@@ -338,7 +338,10 @@ class EpochLogger(Logger):
         if val is not None:
             super().log_tabular(key, val)
         else:
-            v = self.epoch_dict[key]
+            if key not in self.epoch_dict:
+                v = 0.
+            else:
+                v = self.epoch_dict[key]
             if len(v) == 0:
                 super().log_tabular(key if average_only else 'Average' + key, np.nan)
                 if not (average_only):

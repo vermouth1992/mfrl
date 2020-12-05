@@ -1,8 +1,8 @@
 import gym
 from gym import register
 
-from .wrappers import model_based_wrapper_dict, ModelBasedFn
 from envs.vector.sync_vector_env import SyncVectorEnv
+from .wrappers import model_based_wrapper_dict, ModelBasedFn
 
 print('Warning! Using truncated obs Ant-v2')
 del gym.envs.registry.env_specs['Ant-v2']
@@ -20,6 +20,12 @@ register(
     id='Humanoid-v2',
     entry_point='envs.envs.humanoid:HumanoidEnv',
     max_episode_steps=1000,
+)
+
+register(
+    id='CartPole-v2',
+    entry_point='envs.envs.cartpole_continuous:CartPoleContinuousEnv',
+    max_episode_steps=1000
 )
 
 
