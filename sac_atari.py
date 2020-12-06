@@ -344,13 +344,11 @@ class SACAgent(tf.keras.Model):
                  gamma=0.99,
                  target_entropy=None,
                  huber_delta=1.0,
-                 tau=5e-3,
                  ):
         super(SACAgent, self).__init__()
         self.ob_dim = ob_dim
         self.ac_dim = ac_dim
         self.huber_delta = huber_delta
-        self.tau = tau
 
         self.q_network = QNetwork(ob_dim, ac_dim)
         self.target_q_network = QNetwork(ob_dim, ac_dim)
@@ -382,7 +380,7 @@ class SACAgent(tf.keras.Model):
         self.logger.log_tabular('LossAlpha', average_only=True)
 
     def update_target(self):
-        soft_update(self.target_q_network, self.q_network, self.tau)
+        hard_update(self.target_q_network, self.q_network)
 
     def _get_pi_distribution(self, obs):
         q_values = self.q_network(obs, training=False)
@@ -497,7 +495,7 @@ def sac(env_name,
         # sac args
         learning_rate=3e-4,
         alpha=0.2,
-        tau=5e-3,
+        target_update_freq=10000,
         gamma=0.99,
         # replay
         replay_size=int(1e6),
@@ -514,7 +512,7 @@ def sac(env_name,
 
     frame_history_len = 4
 
-    atari_preprocess_wrapper = lambda env: AtariPreprocessing(env=env, frame_skip=1)
+    atari_preprocess_wrapper = lambda env: AtariPreprocessing(env=env, frame_skip=4 if 'NoFrameskip' in env_name else 1)
     frame_stack_wrapper = lambda env: FrameStack(env=env, num_stack=frame_history_len)
 
     env = gym.make(env_name) if env_fn is None else env_fn()
@@ -567,7 +565,7 @@ def sac(env_name,
     # schedules for target_entropy
     target_entropy_scheduler = tf.keras.optimizers.schedules.PolynomialDecay(
         initial_learning_rate=base_entropy,
-        decay_steps=5e5,
+        decay_steps=1e6,
         end_learning_rate=base_entropy * 0.1
     )
 
@@ -611,7 +609,7 @@ def sac(env_name,
         if t >= update_after and (t + 1) % update_every == 0:
             for j in range(update_every * update_per_step):
                 batch = replay_buffer.sample(batch_size)
-                agent.update(**batch, update_target=True)
+                agent.update(**batch, update_target=(t + 1) % target_update_freq == 0)
 
         bar.update(1)
 
@@ -625,17 +623,17 @@ def sac(env_name,
                 agent.save_weights(filepath=os.path.join(logger_kwargs['output_dir'], f'agent_final_{epoch}.ckpt'))
 
             # Test the performance of the deterministic version of the agent.
-            test_agent()
+            # test_agent()
 
             agent.set_target_entropy(target_entropy_scheduler(t + 1))
 
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
+            # logger.log_tabular('TestEpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
-            logger.log_tabular('TotalEnvInteracts', t)
+            # logger.log_tabular('TestEpLen', average_only=True)
+            logger.log_tabular('TotalEnvInteracts', t + 1)
             agent.log_tabular()
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
@@ -656,13 +654,13 @@ if __name__ == '__main__':
     # agent arguments
     parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
-    parser.add_argument('--tau', type=float, default=5e-3)
+    parser.add_argument('--target_update_freq', type=int, default=10000)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
-    parser.add_argument('--steps_per_epoch', type=int, default=5000)
+    parser.add_argument('--steps_per_epoch', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_test_episodes', type=int, default=10)
     parser.add_argument('--update_after', type=int, default=1000)
