@@ -91,7 +91,8 @@ class Logger:
         self.log_current_row = {}
         self.exp_name = exp_name
 
-    def log(self, msg, color='green'):
+    @staticmethod
+    def log(msg, color='green'):
         """Print a colorized message to stdout."""
         if proc_id() == 0:
             print(colorize(msg, color, bold=True))

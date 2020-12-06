@@ -1,6 +1,5 @@
 import os
 import time
-from collections import deque
 
 import gym
 import numpy as np
@@ -189,21 +188,71 @@ class ReplayBufferFrame(object):
         self.done[idx] = done
 
 
-class QNetworkMLP(tf.keras.layers.Layer):
-    def __init__(self, obs_dim, act_dim):
-        super(QNetworkMLP, self).__init__()
+class EnsembleDense(tf.keras.layers.Dense):
+    def __init__(self, num_ensembles, units, **kwargs):
+        super(EnsembleDense, self).__init__(units=units, **kwargs)
+        self.num_ensembles = num_ensembles
+
+    def build(self, input_shape):
+        last_dim = int(input_shape[-1])
+        self.kernel = self.add_weight(
+            'kernel',
+            shape=[self.num_ensembles, last_dim, self.units],
+            initializer=self.kernel_initializer,
+            regularizer=self.kernel_regularizer,
+            constraint=self.kernel_constraint,
+            dtype=self.dtype,
+            trainable=True)
+        if self.use_bias:
+            self.bias = self.add_weight(
+                'bias',
+                shape=[self.num_ensembles, 1, self.units],
+                initializer=self.bias_initializer,
+                regularizer=self.bias_regularizer,
+                constraint=self.bias_constraint,
+                dtype=self.dtype,
+                trainable=True)
+        else:
+            self.bias = None
+        self.built = True
+
+    def call(self, inputs):
+        outputs = tf.linalg.matmul(inputs, self.kernel)  # (num_ensembles, None, units)
+        if self.use_bias:
+            outputs = outputs + self.bias
+        if self.activation is not None:
+            return self.activation(outputs)  # pylint: disable=not-callable
+        return outputs
+
+
+class SqueezeLayer(tf.keras.layers.Layer):
+    def __init__(self, axis=-1):
+        super(SqueezeLayer, self).__init__()
+        self.axis = axis
 
     def call(self, inputs, **kwargs):
-        pass
+        return tf.squeeze(inputs, axis=self.axis)
 
 
-class QNetworkCNN(tf.keras.layers.Layer):
+def build_mlp_ensemble(input_dim, output_dim, mlp_hidden, num_ensembles, num_layers=3,
+                       activation='relu', out_activation=None, squeeze=True):
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.InputLayer(batch_input_shape=(num_ensembles, None, input_dim)))
+    for _ in range(num_layers - 1):
+        model.add(EnsembleDense(num_ensembles, mlp_hidden, activation=activation))
+    model.add(EnsembleDense(num_ensembles, output_dim, activation=out_activation))
+    if output_dim == 1 and squeeze is True:
+        model.add(SqueezeLayer(axis=-1))
+    return model
+
+
+class QNetwork(tf.keras.layers.Layer):
     """
     Both Q value and policy with shared features
     """
 
-    def __init__(self, obs_dim, act_dim):
-        super(QNetworkCNN, self).__init__()
+    def __init__(self, obs_dim, act_dim, num_ensembles=2):
+        super(QNetwork, self).__init__()
         self.features = tf.keras.Sequential([
             tf.keras.layers.InputLayer(input_shape=obs_dim),
             tf.keras.layers.Conv2D(filters=32, kernel_size=8, strides=4, padding='valid', activation='relu'),
@@ -211,19 +260,24 @@ class QNetworkCNN(tf.keras.layers.Layer):
             tf.keras.layers.Conv2D(filters=64, kernel_size=3, strides=1, padding='valid', activation='relu'),
             tf.keras.layers.Flatten()
         ])
-        self.q_feature = tf.keras.layers.Dense(units=256, activation='relu')
-        self.adv_fc = tf.keras.layers.Dense(units=act_dim)
-        self.value_fc = tf.keras.layers.Dense(units=1)
+        self.num_ensembles = num_ensembles
+        self.q_feature = EnsembleDense(num_ensembles=num_ensembles, units=256, activation='relu')
+        self.adv_fc = EnsembleDense(num_ensembles=num_ensembles, units=act_dim)
+        self.value_fc = EnsembleDense(num_ensembles=num_ensembles, units=1)
         self.build(input_shape=[(None,) + obs_dim, True])
 
     def call(self, inputs, training=None):
         features = self.features(inputs, training=training)
+        features = tf.tile(tf.expand_dims(features, axis=0), multiples=(self.num_ensembles, 1, 1))
         q_value = self.q_feature(features)
         adv = self.adv_fc(q_value)
         adv = adv - tf.reduce_mean(adv, axis=-1, keepdims=True)
         value = self.value_fc(q_value)
         q_value = value + adv
-        return q_value
+        if training:
+            return q_value
+        else:
+            return tf.reduce_min(q_value, axis=0)
 
 
 @tf.function
@@ -265,9 +319,10 @@ def combined_shape(length, shape=None):
 
 def gather_q_values(q_values, actions):
     batch_size = tf.shape(actions)[0]
-    q_values = tf.gather_nd(q_values, indices=tf.stack([
-        tf.range(batch_size), actions
-    ], axis=-1))
+    idx = tf.stack([tf.range(batch_size), actions], axis=-1)  # (None, 2)
+    q1 = tf.gather_nd(q_values[0], indices=idx)
+    q2 = tf.gather_nd(q_values[1], indices=idx)
+    q_values = tf.stack([q1, q2], axis=0)
     return q_values
 
 
@@ -289,50 +344,50 @@ class SACAgent(tf.keras.Model):
                  gamma=0.99,
                  target_entropy=None,
                  huber_delta=1.0,
+                 tau=5e-3,
                  ):
         super(SACAgent, self).__init__()
         self.ob_dim = ob_dim
         self.ac_dim = ac_dim
         self.huber_delta = huber_delta
-        if isinstance(ob_dim, int):
-            self.q_network = QNetworkMLP(ob_dim, ac_dim)
-        else:
-            self.q_network = QNetworkCNN(ob_dim, ac_dim)
-            self.target_q_network = QNetworkCNN(ob_dim, ac_dim)
+        self.tau = tau
+
+        self.q_network = QNetwork(ob_dim, ac_dim)
+        self.target_q_network = QNetwork(ob_dim, ac_dim)
         hard_update(self.target_q_network, self.q_network)
 
         self.q_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
 
-        self.log_alpha = LagrangeLayer(initial_value=inverse_softplus(alpha))
-        self.alpha_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
-        self.target_entropy = np.log(ac_dim) / ac_dim if target_entropy is None else target_entropy
+        self.log_alpha = LagrangeLayer(initial_value=alpha)
+        self.alpha_optimizer = tf.keras.optimizers.Adam(lr=1e-3)
+        target_entropy = np.log(ac_dim) if target_entropy is None else target_entropy
+        self.target_entropy = tf.Variable(initial_value=target_entropy, dtype=tf.float32, trainable=False)
 
         self.gamma = gamma
 
     def set_logger(self, logger):
         self.logger = logger
 
+    def set_target_entropy(self, target_entropy):
+        EpochLogger.log(f'Setting target entropy to {target_entropy:.4f}')
+        target_entropy = tf.cast(target_entropy, dtype=tf.float32)
+        self.target_entropy.assign(target_entropy)
+
     def log_tabular(self):
-        self.logger.log_tabular('QVals', with_min_and_max=True)
+        self.logger.log_tabular('Q1Vals', with_min_and_max=True)
+        self.logger.log_tabular('Q2Vals', with_min_and_max=True)
         self.logger.log_tabular('LogPi', average_only=True)
         self.logger.log_tabular('LossQ', average_only=True)
         self.logger.log_tabular('Alpha', average_only=True)
         self.logger.log_tabular('LossAlpha', average_only=True)
 
     def update_target(self):
-        hard_update(self.target_q_network, self.q_network)
+        soft_update(self.target_q_network, self.q_network, self.tau)
 
-    def _compute_pi_from_q(self, q_values):
-        """
-
-        Args:
-            q_values: (None, act_dim)
-
-        Returns: a categorical distribution
-
-        """
-        # warning: this may cause numerical issues
-        q_values = q_values / self.log_alpha()
+    def _get_pi_distribution(self, obs):
+        q_values = self.q_network(obs, training=False)
+        q_values = q_values / self.log_alpha(obs)
+        q_values = tf.stop_gradient(q_values)
         return tfd.Categorical(logits=q_values)
 
     @tf.function
@@ -350,29 +405,35 @@ class SACAgent(tf.keras.Model):
 
         """
         print('Tracing _update_nets')
+
         with tf.GradientTape() as q_tape, tf.GradientTape() as alpha_tape:
             q_tape.watch(self.q_network.trainable_variables)
-            alpha_tape.watch(self.log_alpha.trainable_variables)
 
-            alpha = self.log_alpha()
+            alpha = self.log_alpha(next_obs)
             # compute target Q value with double Q learning
-            target_q_values = self.target_q_network(next_obs)  # (None, act_dim)
-            policy = self._compute_pi_from_q(target_q_values)
-            v = tf.reduce_mean(target_q_values * policy.probs_parameter(), axis=-1)
-            policy_entropy = policy.entropy()
+            target_q_values = self.target_q_network(next_obs, training=False)  # (None, act_dim)
+            next_policy = self._get_pi_distribution(next_obs)
+            v = tf.reduce_sum(target_q_values * next_policy.probs_parameter(), axis=-1)
+            policy_entropy = next_policy.entropy()
             target_q_values = v + alpha * policy_entropy
             q_target = reward + self.gamma * (1.0 - done) * target_q_values
             q_target = tf.stop_gradient(q_target)
             # compute Q and actor loss
-            q_values = self.q_network(obs)  # (None, act_dim)
-            q_values_behavior = gather_q_values(q_values, actions)
+            q_values = self.q_network(obs, training=True)  # (2, None, act_dim)
+            # selection using actions
+            q_values = gather_q_values(q_values, actions)  # (2, None)
+
             # q loss
             if self.huber_delta is not None:
-                q_values_loss = huber_loss(q_target, q_values_behavior, delta=self.huber_delta)
+                q_values_loss = huber_loss(tf.expand_dims(q_target, axis=0), q_values, delta=self.huber_delta)
             else:
-                q_values_loss = 0.5 * tf.square(q_target - q_values_behavior)
+                q_values_loss = 0.5 * tf.square(tf.expand_dims(q_target, axis=0) - q_values)
 
-            alpha_loss = -tf.reduce_mean(alpha * (tf.stop_gradient(-policy.entropy()) + self.target_entropy))
+            q_values_loss = tf.reduce_sum(q_values_loss, axis=0)  # (None,)
+            # apply importance weights
+            q_values_loss = tf.reduce_mean(q_values_loss)
+
+            alpha_loss = -tf.reduce_mean(alpha * (-policy_entropy + self.target_entropy))
 
         # update Q network
         q_gradients = q_tape.gradient(q_values_loss, self.q_network.trainable_variables)
@@ -382,9 +443,10 @@ class SACAgent(tf.keras.Model):
         self.alpha_optimizer.apply_gradients(zip(alpha_gradient, self.log_alpha.trainable_variables))
 
         info = dict(
-            QVals=q_values_behavior,
+            Q1Vals=q_values[0],
+            Q2Vals=q_values[1],
             LogPi=-policy_entropy,
-            Alpha=self.log_alpha(),
+            Alpha=alpha,
             LossQ=q_values_loss,
             LossAlpha=alpha_loss,
         )
@@ -413,7 +475,10 @@ class SACAgent(tf.keras.Model):
     @tf.function
     def act_batch(self, obs, deterministic):
         print(f'Tracing sac act_batch with obs {obs}')
-        pi_final = self.q_network((obs, deterministic))[0]
+        pi_distribution = self._get_pi_distribution(obs)
+        pi_final = tf.cond(pred=deterministic,
+                           true_fn=lambda: tf.argmax(pi_distribution.probs_parameter(), axis=-1, output_type=tf.int32),
+                           false_fn=lambda: pi_distribution.sample())
         return pi_final
 
 
@@ -432,7 +497,7 @@ def sac(env_name,
         # sac args
         learning_rate=3e-4,
         alpha=0.2,
-        update_target_every=1000,
+        tau=5e-3,
         gamma=0.99,
         # replay
         replay_size=int(1e6),
@@ -447,18 +512,20 @@ def sac(env_name,
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    wrapper = lambda env: AtariPreprocessing(env=env)
+    frame_history_len = 4
+
+    atari_preprocess_wrapper = lambda env: AtariPreprocessing(env=env, frame_skip=1)
+    frame_stack_wrapper = lambda env: FrameStack(env=env, num_stack=frame_history_len)
 
     env = gym.make(env_name) if env_fn is None else env_fn()
     max_episode_steps = env._max_episode_steps
     print(f'max_episode_steps={max_episode_steps}')
-    env = wrapper(env)
+    env = atari_preprocess_wrapper(env)
     env.seed(seed)
-    test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=False,
-                               wrappers=wrapper)
+    test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=True,
+                               wrappers=[atari_preprocess_wrapper, frame_stack_wrapper])
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.n
-    frame_history_len = 4
 
     print(f'Observation dim: {obs_dim}. Action dim: {act_dim}')
 
@@ -476,15 +543,11 @@ def sac(env_name,
         return agent.act_batch(o, tf.convert_to_tensor(deterministic)).numpy()
 
     def test_agent():
-        obs_seq = deque(maxlen=frame_history_len)
-        for _ in range(frame_history_len):
-            obs_seq.append(np.zeros(shape=(num_test_episodes,) + obs_dim, dtype=np.uint8))
         o, d, ep_ret, ep_len = test_env.reset(), np.zeros(shape=num_test_episodes, dtype=np.bool), \
                                np.zeros(shape=num_test_episodes), np.zeros(shape=num_test_episodes, dtype=np.int64)
         t = tqdm(total=1, desc='Testing')
         while not np.all(d):
-            obs_seq.append(o)
-            o = np.stack(obs_seq, axis=-1)
+            o = np.transpose(o, axes=(0, 2, 3, 1))  # (None, 84, 84, 4)
             a = get_action_batch(o, deterministic=True)
             o, r, d_, _ = test_env.step(a)
             ep_ret = r * (1 - d) + ep_ret
@@ -499,6 +562,14 @@ def sac(env_name,
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
     bar = tqdm(total=steps_per_epoch)
+
+    base_entropy = np.log(act_dim)
+    # schedules for target_entropy
+    target_entropy_scheduler = tf.keras.optimizers.schedules.PolynomialDecay(
+        initial_learning_rate=base_entropy,
+        decay_steps=5e5,
+        end_learning_rate=base_entropy * 0.1
+    )
 
     # Main loop: collect experience in env and update/log each epoch
     for t in range(total_steps):
@@ -540,7 +611,7 @@ def sac(env_name,
         if t >= update_after and (t + 1) % update_every == 0:
             for j in range(update_every * update_per_step):
                 batch = replay_buffer.sample(batch_size)
-                agent.update(**batch, update_target=(t + 1) % update_target_every == 0)
+                agent.update(**batch, update_target=True)
 
         bar.update(1)
 
@@ -555,6 +626,8 @@ def sac(env_name,
 
             # Test the performance of the deterministic version of the agent.
             test_agent()
+
+            agent.set_target_entropy(target_entropy_scheduler(t + 1))
 
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
@@ -583,13 +656,13 @@ if __name__ == '__main__':
     # agent arguments
     parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
-    parser.add_argument('--update_target_every', type=float, default=100)
+    parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--start_steps', type=int, default=1000)
+    parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
-    parser.add_argument('--steps_per_epoch', type=int, default=2000)
+    parser.add_argument('--steps_per_epoch', type=int, default=5000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_test_episodes', type=int, default=10)
     parser.add_argument('--update_after', type=int, default=1000)

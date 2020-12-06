@@ -231,9 +231,7 @@ class SACAgent(tf.keras.Model):
         self.q_network = QNetwork(ob_dim, ac_dim, mlp_hidden=mlp_hidden)
         self.target_q_network = QNetwork(ob_dim, ac_dim, mlp_hidden=mlp_hidden)
         hard_update(self.target_q_network, self.q_network)
-        self.policy_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
         self.q_optimizer = tf.keras.optimizers.Adam(lr=learning_rate)
-
         self.log_alpha = LagrangeLayer(initial_value=inverse_softplus(alpha))
         self.alpha_optimizer = tf.keras.optimizers.Adam(lr=1e-3)
         target_entropy = np.log(ac_dim) if target_entropy is None else target_entropy
@@ -245,7 +243,7 @@ class SACAgent(tf.keras.Model):
         self.logger = logger
 
     def set_target_entropy(self, target_entropy):
-        print(f'Setting target entropy to {target_entropy:.4f}')
+        EpochLogger.log(f'Setting target entropy to {target_entropy:.4f}')
         target_entropy = tf.cast(target_entropy, dtype=tf.float32)
         self.target_entropy.assign(target_entropy)
 
