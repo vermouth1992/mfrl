@@ -344,11 +344,13 @@ class SACAgent(tf.keras.Model):
                  gamma=0.99,
                  target_entropy=None,
                  huber_delta=1.0,
+                 tau=5e-3,
                  ):
         super(SACAgent, self).__init__()
         self.ob_dim = ob_dim
         self.ac_dim = ac_dim
         self.huber_delta = huber_delta
+        self.tau = tau
 
         self.q_network = QNetwork(ob_dim, ac_dim)
         self.target_q_network = QNetwork(ob_dim, ac_dim)
@@ -380,7 +382,7 @@ class SACAgent(tf.keras.Model):
         self.logger.log_tabular('LossAlpha', average_only=True)
 
     def update_target(self):
-        hard_update(self.target_q_network, self.q_network)
+        soft_update(self.target_q_network, self.q_network, self.tau)
 
     def _get_pi_distribution(self, obs):
         q_values = self.q_network(obs, training=False)
@@ -495,7 +497,7 @@ def sac(env_name,
         # sac args
         learning_rate=3e-4,
         alpha=0.2,
-        target_update_freq=1000,
+        tau=5e-3,
         gamma=0.99,
         # replay
         replay_size=int(1e6),
@@ -528,7 +530,7 @@ def sac(env_name,
     print(f'Observation dim: {obs_dim}. Action dim: {act_dim}')
 
     agent = SACAgent(ob_dim=obs_dim + (frame_history_len,), ac_dim=act_dim,
-                     learning_rate=learning_rate, alpha=alpha, gamma=gamma)
+                     learning_rate=learning_rate, alpha=alpha, gamma=gamma, tau=tau)
     agent.set_logger(logger)
     replay_buffer = ReplayBufferFrame(size=replay_size, frame_history_len=frame_history_len)
 
@@ -565,7 +567,7 @@ def sac(env_name,
     # schedules for target_entropy
     target_entropy_scheduler = tf.keras.optimizers.schedules.PolynomialDecay(
         initial_learning_rate=base_entropy,
-        decay_steps=1e6,
+        decay_steps=5e6,
         end_learning_rate=base_entropy * 0.1
     )
 
@@ -609,10 +611,7 @@ def sac(env_name,
         if t >= update_after and (t + 1) % update_every == 0:
             for j in range(int(update_every * update_per_step)):
                 batch = replay_buffer.sample(batch_size)
-                agent.update(**batch, update_target=False)
-
-        if (t + 1) % target_update_freq == 0:
-            agent.update_target()
+                agent.update(**batch, update_target=True)
 
         bar.update(1)
 
@@ -657,10 +656,10 @@ if __name__ == '__main__':
     # agent arguments
     parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
-    parser.add_argument('--target_update_freq', type=int, default=1000)
+    parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=10000)
