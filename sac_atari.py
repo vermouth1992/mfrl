@@ -495,7 +495,7 @@ def sac(env_name,
         # sac args
         learning_rate=3e-4,
         alpha=0.2,
-        target_update_freq=10000,
+        target_update_freq=1000,
         gamma=0.99,
         # replay
         replay_size=int(1e6),
@@ -520,8 +520,8 @@ def sac(env_name,
     print(f'max_episode_steps={max_episode_steps}')
     env = atari_preprocess_wrapper(env)
     env.seed(seed)
-    test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=True,
-                               wrappers=[atari_preprocess_wrapper, frame_stack_wrapper])
+    # test_env = gym.vector.make(env_name, num_envs=num_test_episodes, asynchronous=True,
+    #                            wrappers=[atari_preprocess_wrapper, frame_stack_wrapper])
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.n
 
@@ -607,9 +607,12 @@ def sac(env_name,
 
         # Update handling
         if t >= update_after and (t + 1) % update_every == 0:
-            for j in range(update_every * update_per_step):
+            for j in range(int(update_every * update_per_step)):
                 batch = replay_buffer.sample(batch_size)
-                agent.update(**batch, update_target=(t + 1) % target_update_freq == 0)
+                agent.update(**batch, update_target=False)
+
+        if (t + 1) % target_update_freq == 0:
+            agent.update_target()
 
         bar.update(1)
 
@@ -654,18 +657,18 @@ if __name__ == '__main__':
     # agent arguments
     parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--alpha', type=float, default=0.2)
-    parser.add_argument('--target_update_freq', type=int, default=10000)
+    parser.add_argument('--target_update_freq', type=int, default=1000)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=10000)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_test_episodes', type=int, default=10)
     parser.add_argument('--update_after', type=int, default=1000)
-    parser.add_argument('--update_every', type=int, default=50)
-    parser.add_argument('--update_per_step', type=int, default=1)
+    parser.add_argument('--update_every', type=int, default=20)
+    parser.add_argument('--update_per_step', type=float, default=0.25)
     parser.add_argument('--save_freq', type=int, default=10)
 
     args = vars(parser.parse_args())
