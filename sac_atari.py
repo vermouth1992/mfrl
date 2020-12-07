@@ -1,3 +1,7 @@
+"""
+The code for the scheduler and the replay buffer is adapted from CS294-112 Spring 2017 HW3
+"""
+
 import os
 import time
 
@@ -15,6 +19,50 @@ set_tf_allow_growth()
 
 tfd = tfp.distributions
 tfl = tfp.layers
+
+
+def linear_interpolation(l, r, alpha):
+    return l + alpha * (r - l)
+
+
+class PiecewiseSchedule(object):
+    def __init__(self, endpoints, interpolation=linear_interpolation, outside_value=None):
+        """Piecewise schedule.
+        endpoints: [(int, int)]
+            list of pairs `(time, value)` meanining that schedule should output
+            `value` when `t==time`. All the values for time must be sorted in
+            an increasing order. When t is between two times, e.g. `(time_a, value_a)`
+            and `(time_b, value_b)`, such that `time_a <= t < time_b` then value outputs
+            `interpolation(value_a, value_b, alpha)` where alpha is a fraction of
+            time passed between `time_a` and `time_b` for time `t`.
+        interpolation: lambda float, float, float: float
+            a function that takes value to the left and to the right of t according
+            to the `endpoints`. Alpha is the fraction of distance from left endpoint to
+            right endpoint that t has covered. See linear_interpolation for example.
+        outside_value: float
+            if the value is requested outside of all the intervals sepecified in
+            `endpoints` this value is returned. If None then AssertionError is
+            raised when outside value is requested.
+        """
+        idxes = [e[0] for e in endpoints]
+        assert idxes == sorted(idxes)
+        self._interpolation = interpolation
+        if outside_value is None:
+            self._outside_value = self._endpoints[-1][-1]
+        else:
+            self._outside_value = outside_value
+        self._endpoints = endpoints
+
+    def value(self, t):
+        """See Schedule.value"""
+        for (l_t, l), (r_t, r) in zip(self._endpoints[:-1], self._endpoints[1:]):
+            if l_t <= t and t < r_t:
+                alpha = float(t - l_t) / (r_t - l_t)
+                return self._interpolation(l, r, alpha)
+
+        # t does not belong to any of the pieces, so doom.
+        assert self._outside_value is not None
+        return self._outside_value
 
 
 class ReplayBufferFrame(object):
@@ -56,11 +104,12 @@ class ReplayBufferFrame(object):
         return batch_size + 1 <= self.num_in_buffer
 
     def _encode_sample(self, idxes):
-        obs_batch = np.concatenate([self._encode_observation(idx)[None] for idx in idxes], 0)
+        all_obs_batch = np.stack([self._encode_observation(idx + 1, self.frame_history_len + 1) for idx in idxes], 0)
+        obs_batch = all_obs_batch[:, :, :, 0:self.frame_history_len]
         act_batch = self.action[idxes]
         rew_batch = self.reward[idxes]
-        next_obs_batch = np.concatenate([self._encode_observation(idx + 1)[None] for idx in idxes], 0)
-        done_mask = np.array([1.0 if self.done[idx] else 0.0 for idx in idxes], dtype=np.float32)
+        next_obs_batch = all_obs_batch[:, :, :, 1:self.frame_history_len + 1]
+        done_mask = self.done[idxes].astype(np.float32)
 
         return dict(
             obs=obs_batch,
@@ -100,7 +149,7 @@ class ReplayBufferFrame(object):
             Array of shape (batch_size,) and dtype np.float32
         """
         assert self.can_sample(batch_size)
-        idxes = np.random.choice(self.num_in_buffer - 1, size=batch_size, replace=False)
+        idxes = np.random.choice(self.num_in_buffer - 1, size=batch_size, replace=True)
         return self._encode_sample(idxes)
 
     def encode_recent_observation(self):
@@ -113,11 +162,11 @@ class ReplayBufferFrame(object):
             encodes frame at time `t - frame_history_len + i`
         """
         assert self.num_in_buffer > 0
-        return self._encode_observation((self.next_idx - 1) % self.size)
+        return self._encode_observation((self.next_idx - 1) % self.size, num_frames=self.frame_history_len)
 
-    def _encode_observation(self, idx):
+    def _encode_observation(self, idx, num_frames):
         end_idx = idx + 1  # make noninclusive
-        start_idx = end_idx - self.frame_history_len
+        start_idx = end_idx - num_frames
         # this checks if we are using low-dimensional observations, such as RAM
         # state, in which case we just directly return the latest RAM.
         if len(self.obs.shape) == 2:
@@ -128,7 +177,7 @@ class ReplayBufferFrame(object):
         for idx in range(start_idx, end_idx - 1):
             if self.done[idx % self.size]:
                 start_idx = idx + 1
-        missing_context = self.frame_history_len - (end_idx - start_idx)
+        missing_context = num_frames - (end_idx - start_idx)
         # if zero padding is needed for missing context
         # or we are on the boundry of the buffer
         if start_idx < 0 or missing_context > 0:
@@ -442,6 +491,8 @@ class SACAgent(tf.keras.Model):
         alpha_gradient = alpha_tape.gradient(alpha_loss, self.log_alpha.trainable_variables)
         self.alpha_optimizer.apply_gradients(zip(alpha_gradient, self.log_alpha.trainable_variables))
 
+        self.update_target()
+
         info = dict(
             Q1Vals=q_values[0],
             Q2Vals=q_values[1],
@@ -452,7 +503,7 @@ class SACAgent(tf.keras.Model):
         )
         return info
 
-    def update(self, obs, act, obs2, done, rew, update_target=True):
+    def update(self, obs, act, obs2, done, rew):
         obs = tf.convert_to_tensor(obs, dtype=tf.float32) / 255.
         act = tf.convert_to_tensor(act, dtype=tf.int32)
         obs2 = tf.convert_to_tensor(obs2, dtype=tf.float32) / 255.
@@ -463,9 +514,6 @@ class SACAgent(tf.keras.Model):
         for key, item in info.items():
             info[key] = item.numpy()
         self.logger.store(**info)
-
-        if update_target:
-            self.update_target()
 
     def act(self, obs, deterministic):
         obs = tf.expand_dims(obs, axis=0)
@@ -561,14 +609,23 @@ def sac(env_name,
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
-    bar = tqdm(total=steps_per_epoch)
+    bar = tqdm(total=steps_per_epoch, desc=f'Epoch {1}/{epochs}')
 
     base_entropy = np.log(act_dim)
     # schedules for target_entropy
-    target_entropy_scheduler = tf.keras.optimizers.schedules.PolynomialDecay(
-        initial_learning_rate=base_entropy,
-        decay_steps=5e6,
-        end_learning_rate=base_entropy * 0.1
+
+    probs = [0.9] + [0.1 / (act_dim - 1)] * (act_dim - 1)
+    epsilon_0_1 = tfd.Categorical(probs=probs).entropy().numpy().item()
+    epsilon_0_0_1 = tfd.Categorical(probs=[0.99] + [0.01 / (act_dim - 1)] * (act_dim - 1)).entropy().numpy().item()
+
+    print(f'Setting entropy: {base_entropy:.2f}, {epsilon_0_1:.2f}, {epsilon_0_0_1:.2f}')
+
+    target_entropy_scheduler = PiecewiseSchedule(
+        [
+            (0, base_entropy),
+            (1e6, epsilon_0_1),
+            (total_steps / 2, epsilon_0_0_1),
+        ], outside_value=epsilon_0_0_1
     )
 
     # Main loop: collect experience in env and update/log each epoch
@@ -611,7 +668,7 @@ def sac(env_name,
         if t >= update_after and (t + 1) % update_every == 0:
             for j in range(int(update_every * update_per_step)):
                 batch = replay_buffer.sample(batch_size)
-                agent.update(**batch, update_target=True)
+                agent.update(**batch)
 
         bar.update(1)
 
@@ -621,13 +678,13 @@ def sac(env_name,
 
             epoch = (t + 1) // steps_per_epoch
 
-            if epoch % save_freq == 0:
+            if save_freq is not None and epoch % save_freq == 0:
                 agent.save_weights(filepath=os.path.join(logger_kwargs['output_dir'], f'agent_final_{epoch}.ckpt'))
 
             # Test the performance of the deterministic version of the agent.
             # test_agent()
 
-            agent.set_target_entropy(target_entropy_scheduler(t + 1))
+            agent.set_target_entropy(target_entropy_scheduler.value(t + 1))
 
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
@@ -641,7 +698,7 @@ def sac(env_name,
             logger.dump_tabular()
 
             if t < total_steps:
-                bar = tqdm(total=steps_per_epoch)
+                bar = tqdm(total=steps_per_epoch, desc=f'Epoch {epoch + 1}/{epochs}')
 
     agent.save_weights(filepath=os.path.join(logger_kwargs['output_dir'], f'agent_final.ckpt'))
 
@@ -666,9 +723,9 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_test_episodes', type=int, default=10)
     parser.add_argument('--update_after', type=int, default=1000)
-    parser.add_argument('--update_every', type=int, default=20)
+    parser.add_argument('--update_every', type=int, default=100)
     parser.add_argument('--update_per_step', type=float, default=0.25)
-    parser.add_argument('--save_freq', type=int, default=10)
+    parser.add_argument('--save_freq', type=int, default=None)
 
     args = vars(parser.parse_args())
 
