@@ -716,7 +716,7 @@ if __name__ == '__main__':
     parser.add_argument('--tau', type=float, default=5e-3)
     parser.add_argument('--gamma', type=float, default=0.99)
     # training arguments
-    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=2000)
     parser.add_argument('--start_steps', type=int, default=10000)
     parser.add_argument('--replay_size', type=int, default=1000000)
     parser.add_argument('--steps_per_epoch', type=int, default=10000)
